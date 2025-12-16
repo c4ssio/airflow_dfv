@@ -1,36 +1,33 @@
 x-airflow-common: &airflow-common
   build: .
   environment: &airflow-common-env
-    # --- Core Airflow ---
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__CORE__FERNET_KEY: ""
 
-    # Airflow DB
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
 
-    # Celery broker/result backend
     AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
     AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
 
-    # Airflow 3: the UI is served by the API server
     AIRFLOW__API__HOST: "0.0.0.0"
     AIRFLOW__API__PORT: "8080"
 
-    # --- Your SEC scraper config (required user agent) ---
     SEC_USER_AGENT: "drclive SEC scraper (you@drclive.net)"
     SEC_MAX_CIKS_PER_RUN: "25"
     SEC_REQUESTS_PER_SECOND: "5"
     SEC_TIMEOUT_SECONDS: "30"
 
-    # Helpful in docker-compose setups
+    SEC_LOCAL_DIR: "/opt/airflow/data/sec_raw"
+
     AIRFLOW_UID: "${AIRFLOW_UID:-50000}"
 
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
+    - ./data:/opt/airflow/data
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     postgres:

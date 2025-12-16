@@ -1,0 +1,62 @@
+# ----------------------
+# Airflow runtime
+# ----------------------
+logs/
+airflow.db
+airflow.cfg
+
+# Raw / derived data (local only)
+data/
+tmp/
+*.parquet
+*.csv
+*.json
+
+# ----------------------
+# Python artifacts
+# ----------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# ----------------------
+# Virtualenvs
+# ----------------------
+.venv/
+venv/
+env/
+
+# ----------------------
+# Docker / Compose
+# ----------------------
+.dockerignore
+docker-compose.override.yml
+compose.override.yml
+
+# ----------------------
+# OS / Editor junk
+# ----------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# ----------------------
+# Secrets (never commit)
+# ----------------------
+.env
+.env.*
+*.pem
+*.key
+*.crt
+
+# ----------------------
+# Build artifacts
+# ----------------------
+dist/
+build/
+.eggs/
+*.egg-info/
