@@ -60,3 +60,6 @@ dist/
 build/
 .eggs/
 *.egg-info/
+
+# Local diagnostics produced by helper scripts
+diagnostics/
