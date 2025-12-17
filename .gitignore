@@ -63,3 +63,6 @@ build/
 
 # Local diagnostics produced by helper scripts
 diagnostics/
+
+# Local config with generated secrets
+config/
