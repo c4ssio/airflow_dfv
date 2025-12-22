@@ -24,6 +24,7 @@ Requires:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -36,6 +37,8 @@ from airflow import DAG
 from airflow.decorators import task
 from airflow.exceptions import AirflowFailException
 from airflow.utils.edgemodifier import Label
+
+logger = logging.getLogger(__name__)
 
 try:
     # Only needed if you set SEC_S3_BUCKET
@@ -170,6 +173,64 @@ def _write_bytes(path: str, data: bytes) -> None:
         f.write(data)
 
 
+def _get_most_recent_filing_date(submissions_data: Dict[str, Any]) -> Optional[str]:
+    """Extract the most recent filing date from submissions.json data."""
+    if "filings" not in submissions_data:
+        return None
+    filings = submissions_data["filings"]
+    if "recent" not in filings:
+        return None
+    recent = filings["recent"]
+    if "filingDate" not in recent or not recent["filingDate"]:
+        return None
+    filing_dates = recent["filingDate"]
+    if not filing_dates:
+        return None
+    return max(filing_dates)
+
+
+def _find_existing_data(cfg: Settings, cik: str) -> Optional[Dict[str, str]]:
+    """
+    Find the most recent existing data for a CIK.
+    Returns dict with 'submissions' and 'companyfacts' paths, or None if not found.
+    """
+    if cfg.s3_bucket:
+        # For S3, we'd need to list objects - skipping for now, can add later
+        return None
+
+    # For local storage, find the most recent ingest_date directory
+    base_dir = cfg.local_dir
+    if not os.path.exists(base_dir):
+        return None
+
+    # Find all ingest_date directories
+    ingest_dirs = []
+    for item in os.listdir(base_dir):
+        if item.startswith("ingest_date="):
+            cik_dir = os.path.join(base_dir, item, f"cik={cik}")
+            sub_path = os.path.join(cik_dir, "submissions.json")
+            facts_path = os.path.join(cik_dir, "companyfacts.json")
+            if os.path.exists(sub_path) and os.path.exists(facts_path):
+                ingest_dirs.append((item, sub_path, facts_path))
+
+    if not ingest_dirs:
+        return None
+
+    # Sort by ingest_date (descending) and return most recent
+    ingest_dirs.sort(key=lambda x: x[0], reverse=True)
+    _, sub_path, facts_path = ingest_dirs[0]
+    return {"submissions": sub_path, "companyfacts": facts_path}
+
+
+def _read_existing_submissions(path: str) -> Optional[Dict[str, Any]]:
+    """Read existing submissions.json file."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 default_args = {
     "owner": "drclive",
     "retries": 2,
@@ -226,6 +287,9 @@ with DAG(
 
         Store raw JSON in S3 (if configured) else local dir.
 
+        Implements incremental updates: only downloads companyfacts.json (the large file)
+        if there are new filings since the last run.
+
         Returns metadata about where it stored the files.
         """
         cfg = _settings()
@@ -238,11 +302,43 @@ with DAG(
         submissions_url = f"{SEC_BASE}/submissions/CIK{cik10}.json"
         facts_url = f"{SEC_BASE}/api/xbrl/companyfacts/CIK{cik10}.json"
 
+        # Check if we have existing data
+        existing_data = _find_existing_data(cfg, cik)
+        existing_filing_date = None
+        if existing_data and existing_data.get("submissions"):
+            existing_submissions = _read_existing_submissions(existing_data["submissions"])
+            if existing_submissions:
+                existing_filing_date = _get_most_recent_filing_date(existing_submissions)
+
+        # Always download submissions.json (it's relatively small and contains metadata)
         submissions = _get_json(s, submissions_url, cfg.timeout_s, cfg.rps)
-        facts = _get_json(s, facts_url, cfg.timeout_s, cfg.rps)
+        new_filing_date = _get_most_recent_filing_date(submissions)
+
+        # Only download companyfacts.json if there are new filings
+        facts = None
+        facts_bytes = None
+        needs_facts_download = True
+
+        if existing_filing_date and new_filing_date:
+            if new_filing_date <= existing_filing_date:
+                # No new filings, skip downloading the large companyfacts.json file
+                needs_facts_download = False
+                logger.info(
+                    "CIK %s: No new filings since %s. Skipping companyfacts.json download.",
+                    cik,
+                    existing_filing_date,
+                )
+
+        if needs_facts_download:
+            facts = _get_json(s, facts_url, cfg.timeout_s, cfg.rps)
+            facts_bytes = json.dumps(facts, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            existing_facts_path = None
+        else:
+            # Reuse existing companyfacts.json - don't download or copy
+            facts_bytes = None
+            existing_facts_path = existing_data.get("companyfacts") if existing_data else None
 
         submissions_bytes = json.dumps(submissions, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        facts_bytes = json.dumps(facts, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
         if cfg.s3_bucket:
             if S3Hook is None:
@@ -260,18 +356,26 @@ with DAG(
                 bucket_name=cfg.s3_bucket,
                 replace=True,
             )
-            hook.load_bytes(
-                bytes_data=facts_bytes,
-                key=facts_key,
-                bucket_name=cfg.s3_bucket,
-                replace=True,
-            )
+            # Only upload companyfacts if we downloaded it
+            if facts_bytes is not None:
+                hook.load_bytes(
+                    bytes_data=facts_bytes,
+                    key=facts_key,
+                    bucket_name=cfg.s3_bucket,
+                    replace=True,
+                )
+                facts_location = f"s3://{cfg.s3_bucket}/{facts_key}"
+            else:
+                # Use existing facts location (from existing_data)
+                facts_location = existing_facts_path if existing_facts_path else f"s3://{cfg.s3_bucket}/{facts_key}"
+
             return {
                 "cik": cik,
                 "ticker": company.get("ticker", ""),
                 "stored": "s3",
                 "submissions": f"s3://{cfg.s3_bucket}/{sub_key}",
-                "companyfacts": f"s3://{cfg.s3_bucket}/{facts_key}",
+                "companyfacts": facts_location,
+                "facts_downloaded": facts_bytes is not None,
             }
 
         # Local fallback
@@ -279,23 +383,42 @@ with DAG(
         sub_path = os.path.join(base, "submissions.json")
         facts_path = os.path.join(base, "companyfacts.json")
         _write_bytes(sub_path, submissions_bytes)
-        _write_bytes(facts_path, facts_bytes)
+
+        # Only write companyfacts if we downloaded it
+        if facts_bytes is not None:
+            _write_bytes(facts_path, facts_bytes)
+            facts_location = facts_path
+        else:
+            # Use existing facts location (don't copy, just reference)
+            facts_location = existing_facts_path if existing_facts_path else facts_path
+
         return {
             "cik": cik,
             "ticker": company.get("ticker", ""),
             "stored": "local",
             "submissions": sub_path,
-            "companyfacts": facts_path,
+            "companyfacts": facts_location,
+            "facts_downloaded": facts_bytes is not None,
         }
 
     @task
     def summarize(results: List[Dict[str, str]]) -> None:
         stored_s3 = sum(1 for r in results if r.get("stored") == "s3")
         stored_local = sum(1 for r in results if r.get("stored") == "local")
-        print(f"Done. Stored to S3: {stored_s3}, stored locally: {stored_local}")
+        facts_downloaded = sum(1 for r in results if r.get("facts_downloaded", True))
+        facts_skipped = len(results) - facts_downloaded
+        logger.info(
+            "Done. Stored to S3: %d, stored locally: %d",
+            stored_s3,
+            stored_local,
+        )
+        logger.info(
+            "Company facts downloaded: %d, skipped (no new filings): %d",
+            facts_downloaded,
+            facts_skipped,
+        )
         if results:
-            print("Sample output:")
-            print(json.dumps(results[0], indent=2))
+            logger.debug("Sample output: %s", json.dumps(results[0], indent=2))
 
     companies = get_company_ciks()
     stored = fetch_and_store_company_json.expand(company=companies)
