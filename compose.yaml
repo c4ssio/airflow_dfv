@@ -1,10 +1,11 @@
 x-airflow-common: &airflow-common
   build: .
+  env_file:
+    - ./config/secrets.env
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-    AIRFLOW__CORE__FERNET_KEY: ""
 
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
 
@@ -14,9 +15,10 @@ x-airflow-common: &airflow-common
     AIRFLOW__API__HOST: "0.0.0.0"
     AIRFLOW__API__PORT: "8080"
 
-    AIRFLOW__WEBSERVER__BASE_URL: "https://improved-giggle-wv77gx5j7297qp-8080.app.github.dev"
-    AIRFLOW__API__BASE_URL: "https://improved-giggle-wv77gx5j7297qp-8080.app.github.dev"
+    AIRFLOW__WEBSERVER__BASE_URL: "http://localhost:8080"
+    AIRFLOW__API__BASE_URL: "http://airflow-api-server:8080"
     AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX: "True"
+    AIRFLOW__LOGGING__BASE_LOG_FOLDER: "/opt/airflow/logs"
     AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: "/opt/airflow/simple_auth_manager_passwords.json.generated"
 
     SEC_USER_AGENT: "drclive SEC scraper (you@drclive.net)"
