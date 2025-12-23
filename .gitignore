@@ -66,6 +66,8 @@ diagnostics/
 
 # Local config with generated secrets
 config/
+!config/*.example
+!config/secrets.env.example
 
 # Snowflake config (contains credentials)
-plugins/scripts/sec_scraper/snowflake/config.json
+config/snowflake.json

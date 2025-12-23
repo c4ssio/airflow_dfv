@@ -1,6 +1,7 @@
-# Snowflake Schema Deployment
+# Snowflake Migration Deployment
 
-This directory contains scripts to deploy SEC scraper schemas to Snowflake.
+This directory contains scripts to deploy SEC scraper migrations to Snowflake.
+The migration system tracks which migrations have been executed to prevent re-running them.
 
 ## Prerequisites
 
@@ -29,18 +30,25 @@ export SNOWFLAKE_SCHEMA="sec_raw"  # Optional, defaults to sec_raw
 export SNOWFLAKE_ROLE="ACCOUNTADMIN"  # Optional
 ```
 
-### Option 2: Config File
+### Option 2: Config File (Recommended)
 
-1. Copy `config.example.json` to `config.json`:
+1. Copy the example config to the `config/` folder:
    ```bash
-   cp config.example.json config.json
+   cp config/snowflake.json.example config/snowflake.json
    ```
 
-2. Edit `config.json` with your Snowflake credentials
+2. Edit `config/snowflake.json` with your Snowflake credentials
 
-3. Run with `--config config.json`
+3. The script will automatically find `config/snowflake.json` (or use `--config` to specify a different path)
 
-**Note:** `config.json` is gitignored - never commit credentials!
+**Note:** `config/snowflake.json` is gitignored - never commit credentials! The `.example` file is safe to commit.
+
+## Migration Files
+
+Migration files are located in `plugins/scripts/sec_scraper/snowflake/migrations/` and follow the naming pattern:
+- `YYYYMMDD__description.sql` (e.g., `20251222__create_submissions.sql`)
+
+Migrations are executed in chronological order (by date prefix, then filename).
 
 ## Usage
 
@@ -48,19 +56,22 @@ export SNOWFLAKE_ROLE="ACCOUNTADMIN"  # Optional
 
 ```bash
 # Dry run (see what would be executed)
-python plugins/scripts/sec_scraper/snowflake/deploy_schemas.py --dry-run
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --dry-run
 
-# Deploy to default schema (sec_raw)
-python plugins/scripts/sec_scraper/snowflake/deploy_schemas.py
+# Deploy pending migrations to default schema (sec_raw)
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py
 
 # Deploy to custom schema
-python plugins/scripts/sec_scraper/snowflake/deploy_schemas.py --schema my_schema
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --schema my_schema
 
-# Use config file
-python plugins/scripts/sec_scraper/snowflake/deploy_schemas.py --config config.json
+# Use config file (defaults to config/snowflake.json)
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py
+
+# Or specify a different config file
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --config /path/to/config.json
 
 # Verbose output
-python plugins/scripts/sec_scraper/snowflake/deploy_schemas.py --verbose
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --verbose
 ```
 
 ### From Airflow Container
@@ -75,7 +86,7 @@ export SNOWFLAKE_USER="..."
 # ... etc
 
 # Run deployment
-python /opt/airflow/plugins/scripts/sec_scraper/snowflake/deploy_schemas.py
+python /opt/airflow/plugins/scripts/sec_scraper/snowflake/deploy_migrations.py
 ```
 
 ### Using Airflow Connections (Recommended for Production)
@@ -87,16 +98,25 @@ python /opt/airflow/plugins/scripts/sec_scraper/snowflake/deploy_schemas.py
 
 2. Modify the script to use Airflow's connection (or use Airflow's SnowflakeHook)
 
-## SQL Files Deployed
+## Migration Tracking
 
-The script deploys SQL files in this order:
+The migration system:
+- Tracks executed migrations in `{schema}.schema_migrations` table
+- Prevents re-running migrations that have already been executed
+- Detects modified migrations (checksum changes) and re-runs them with a warning
+- Records execution time, success/failure, and error messages
+- Each migration is identified by filename and checksum
 
-1. `submissions.sql` - Company submissions metadata table
-2. `companyfacts.sql` - Company facts tables (metadata + facts)
-3. `us_gaap_metric_abbreviations.sql` - Metric abbreviation mapping table
-4. `submissions_ticker_mapping.sql` - Ticker/exchange mapping view
+**Note:** The old `deploy_schemas.py` script is deprecated. Use `deploy_migrations.py` instead.
 
-All files are read from `plugins/scripts/sec_scraper/schemas/sec_raw/` directory (relative to the script).
+## Migration Files
+
+Migration files are in `plugins/scripts/sec_scraper/snowflake/migrations/` and are executed in chronological order:
+
+1. `20251222__create_submissions.sql` - Company submissions metadata table
+2. `20251222__create_companyfacts.sql` - Company facts tables (metadata + facts)
+3. `20251222__create_us_gaap_metric_abbreviations.sql` - Metric abbreviation mapping table
+4. `20251222__create_submissions_ticker_mapping.sql` - Ticker/exchange mapping view
 
 ## Schema Structure
 
