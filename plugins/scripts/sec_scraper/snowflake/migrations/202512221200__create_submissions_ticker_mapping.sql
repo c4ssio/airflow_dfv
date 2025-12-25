@@ -46,10 +46,10 @@ WHERE
     t.index = e.index  -- Ensure parallel array alignment
 ;
 
-COMMENT ON VIEW sec_raw.submissions_ticker_mapping IS 
-'Normalized view of ticker/exchange mappings from submissions table. Expands parallel arrays into individual rows. 
-Multiple tickers typically represent different share classes (all current), not historical changes.
-Use is_primary_ticker or is_likely_common_stock to identify the main trading ticker.';
+-- Note: Snowflake doesn't support COMMENT ON VIEW. View description:
+-- Normalized view of ticker/exchange mappings from submissions table. Expands parallel arrays into individual rows.
+-- Multiple tickers typically represent different share classes (all current), not historical changes.
+-- Use is_primary_ticker or is_likely_common_stock to identify the main trading ticker.
 
 -- Example queries:
 -- 

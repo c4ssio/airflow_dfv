@@ -7,6 +7,9 @@ It tracks which migrations have been executed to avoid re-running them.
 
 Usage:
     python deploy_migrations.py [--dry-run] [--schema SCHEMA_NAME]
+    python deploy_migrations.py --migrate-one [--dry-run] [--schema SCHEMA_NAME]
+    python deploy_migrations.py --rollback MIGRATION_NAME [--schema SCHEMA_NAME]
+    python deploy_migrations.py --rollback-one [--dry-run] [--schema SCHEMA_NAME]
 
 Environment variables (or config file):
     SNOWFLAKE_ACCOUNT
@@ -122,7 +125,7 @@ class MigrationTracker:
                     '{checksum}' AS checksum,
                     {execution_time_ms} AS execution_time_ms,
                     {success} AS success,
-                    {'NULL' if error_message is None else f"'{error_message.replace("'", "''")}'"} AS error_message,
+                    {'NULL' if error_message is None else f"'{error_message.replace(chr(39), chr(39)+chr(39))}'"} AS error_message,
                     '{current_user}' AS executed_by
             ) AS source
             ON target.migration_name = source.migration_name
@@ -207,9 +210,14 @@ class SnowflakeMigrator:
 
     def parse_migration_filename(self, filename: str) -> Tuple[Optional[str], str]:
         """
-        Parse migration filename: YYYYMMDD__description.sql
+        Parse migration filename: YYYYMMDDHHMM__description.sql or YYYYMMDD__description.sql
         Returns: (date_str, description)
         """
+        # Try YYYYMMDDHHMM format first (new format with hours/minutes)
+        match = re.match(r"^(\d{12})__(.+)\.sql$", filename)
+        if match:
+            return match.group(1), match.group(2)
+        # Fall back to YYYYMMDD format (old format)
         match = re.match(r"^(\d{8})__(.+)\.sql$", filename)
         if match:
             return match.group(1), match.group(2)
@@ -228,7 +236,8 @@ class SnowflakeMigrator:
             else:
                 logger.warning(f"Migration file doesn't match naming pattern: {sql_file.name}")
 
-        # Sort by date, then by filename
+        # Sort by date (which includes timestamp if present), then by filename
+        # This ensures migrations run in chronological order
         migrations.sort(key=lambda x: (x[1], x[2]))
         return migrations
 
@@ -259,6 +268,229 @@ class SnowflakeMigrator:
             logger.info(f"✓ Executed: {description}")
         except Exception as e:
             logger.error(f"✗ Failed to execute {description}: {e}")
+            raise
+
+    def get_latest_migration(self) -> Optional[str]:
+        """Get the most recent migration name from the tracking table."""
+        if self.dry_run:
+            return None
+
+        self.tracker.ensure_migrations_table()
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                f"""
+                SELECT migration_name, executed_at
+                FROM {self.tracker.migrations_table}
+                WHERE success = TRUE
+                ORDER BY executed_at DESC
+                LIMIT 1
+            """
+            )
+            result = cursor.fetchone()
+            if result:
+                return result[0]
+            return None
+        finally:
+            cursor.close()
+
+    def get_next_pending_migration(self, migrations_dir: Path) -> Optional[Tuple[Path, str, str]]:
+        """Get the next pending migration that hasn't been executed yet."""
+        executed = {}
+        if not self.dry_run and self.tracker:
+            executed = self.tracker.get_executed_migrations()
+        migrations = self.find_migrations(migrations_dir)
+
+        for filepath, date_str, migration_name in migrations:
+            if migration_name not in executed:
+                return (filepath, date_str, migration_name)
+        return None
+
+    def rollback_migration(self, migration_name: str):
+        """Rollback a specific migration by dropping its objects."""
+        if self.dry_run:
+            logger.info(f"DRY RUN: Would rollback migration {migration_name}")
+            return
+
+        # Ensure migrations table exists
+        self.tracker.ensure_migrations_table()
+
+        # Get executed migrations
+        executed = self.tracker.get_executed_migrations()
+        if migration_name not in executed:
+            logger.warning(f"Migration {migration_name} not found in executed migrations")
+            logger.info("Available migrations:")
+            for name in executed.keys():
+                logger.info(f"  - {name}")
+            return
+
+        logger.info(f"Rolling back migration: {migration_name}")
+
+        # Find the migration file
+        migrations_dir = Path(__file__).parent / "migrations"
+        migration_file = migrations_dir / migration_name
+        if not migration_file.exists():
+            logger.error(f"Migration file not found: {migration_file}")
+            return
+
+        # Read and parse the migration to extract object names
+        sql_content = self.read_sql_file(migration_file)
+        objects_to_drop = self._extract_objects_from_sql(sql_content)
+
+        # Drop objects in reverse order (views first, then tables)
+        cursor = self.conn.cursor()
+        try:
+            for obj_type, obj_name in reversed(objects_to_drop):
+                full_name = f"{self.schema}.{obj_name}"
+                if obj_type == "VIEW":
+                    drop_sql = f"DROP VIEW IF EXISTS {full_name}"
+                elif obj_type == "TABLE":
+                    drop_sql = f"DROP TABLE IF EXISTS {full_name}"
+                else:
+                    continue
+
+                try:
+                    cursor.execute(drop_sql)
+                    logger.info(f"✓ Dropped {obj_type.lower()} {full_name}")
+                except Exception as e:
+                    logger.warning(f"⚠ Failed to drop {obj_type.lower()} {full_name}: {e}")
+
+            # Remove migration record
+            cursor.execute(
+                f"DELETE FROM {self.tracker.migrations_table} WHERE migration_name = '{migration_name}'"
+            )
+            logger.info(f"✓ Removed migration record for {migration_name}")
+
+        finally:
+            cursor.close()
+
+    def _extract_objects_from_sql(self, sql: str) -> List[Tuple[str, str]]:
+        """
+        Extract CREATE TABLE and CREATE VIEW object names from SQL.
+        Returns list of (object_type, object_name) tuples.
+        """
+        import re
+
+        objects = []
+
+        # Find CREATE TABLE statements
+        table_pattern = r"CREATE\s+(?:OR\s+REPLACE\s+)?TABLE\s+(?:\w+\.)?(\w+)"
+        for match in re.finditer(table_pattern, sql, re.IGNORECASE):
+            objects.append(("TABLE", match.group(1).upper()))
+
+        # Find CREATE VIEW statements
+        view_pattern = r"CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+(?:\w+\.)?(\w+)"
+        for match in re.finditer(view_pattern, sql, re.IGNORECASE):
+            objects.append(("VIEW", match.group(1).upper()))
+
+        return objects
+
+    def deploy_one(self, migrations_dir: Path):
+        """Deploy the next pending migration only."""
+        logger.info(f"Deploying next pending migration to Snowflake schema: {self.schema}")
+
+        # Ensure schema exists
+        create_schema_sql = f"CREATE SCHEMA IF NOT EXISTS {self.schema}"
+        self.execute_sql(create_schema_sql, f"Create schema {self.schema}")
+
+        # Ensure migrations table exists
+        if not self.dry_run:
+            self.tracker.ensure_migrations_table()
+
+        # Get executed migrations
+        executed = {}
+        if not self.dry_run and self.tracker:
+            executed = self.tracker.get_executed_migrations()
+
+        # Find the next pending migration
+        next_migration = self.get_next_pending_migration(migrations_dir)
+        if not next_migration:
+            logger.info("✓ All migrations are up to date")
+            return
+
+        filepath, date_str, migration_name = next_migration
+
+        # Check if already executed (shouldn't happen, but check anyway)
+        if migration_name in executed:
+            existing_checksum = executed[migration_name]["checksum"]
+            sql_content = self.read_sql_file(filepath)
+            current_checksum = self.calculate_checksum(sql_content)
+
+            if current_checksum == existing_checksum:
+                logger.info(f"⏭ Skipping {migration_name} (already executed)")
+                return
+            else:
+                logger.warning(
+                    f"⚠ Migration {migration_name} was modified (checksum changed). "
+                    f"Re-running..."
+                )
+
+        # Execute the migration
+        logger.info(f"▶ Executing migration: {migration_name}")
+
+        sql_content = self.read_sql_file(filepath)
+        checksum = self.calculate_checksum(sql_content)
+
+        # Split SQL file by semicolons
+        statements = self._split_sql_statements(sql_content)
+
+        start_time = datetime.now()
+        success = True
+        error_message = None
+
+        try:
+            for i, statement in enumerate(statements, 1):
+                statement = statement.strip()
+                if not statement:
+                    continue
+
+                # Skip pure comment lines, but strip leading comments from statements
+                if statement.startswith("--") and "\n" not in statement:
+                    continue
+
+                # Remove leading comment lines from the statement
+                lines = statement.split('\n')
+                cleaned_lines = []
+                for line in lines:
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("--"):
+                        cleaned_lines.append(line)
+                    elif not stripped:
+                        # Keep empty lines for formatting
+                        cleaned_lines.append(line)
+                statement = '\n'.join(cleaned_lines).strip()
+
+                if not statement:
+                    continue
+
+                desc = f"{migration_name} (statement {i}/{len(statements)})"
+                self.execute_sql(statement, desc)
+
+            execution_time = (datetime.now() - start_time).total_seconds() * 1000
+
+            # Record successful migration
+            if not self.dry_run:
+                self.tracker.record_migration(
+                    migration_name=migration_name,
+                    checksum=checksum,
+                    execution_time_ms=int(execution_time),
+                    success=True,
+                    error_message=None,
+                )
+            logger.info(f"✓ Completed migration: {migration_name}")
+
+        except Exception as e:
+            execution_time = (datetime.now() - start_time).total_seconds() * 1000
+            error_message = str(e)
+            if not self.dry_run:
+                self.tracker.record_migration(
+                    migration_name=migration_name,
+                    checksum=checksum,
+                    execution_time_ms=int(execution_time),
+                    success=False,
+                    error_message=error_message,
+                )
+            logger.error(f"✗ Migration failed: {migration_name} - {error_message}")
             raise
 
     def deploy(self, migrations_dir: Path):
@@ -317,7 +549,26 @@ class SnowflakeMigrator:
             try:
                 for i, statement in enumerate(statements, 1):
                     statement = statement.strip()
-                    if not statement or statement.startswith("--"):
+                    if not statement:
+                        continue
+                    
+                    # Skip pure comment lines, but strip leading comments from statements
+                    if statement.startswith("--") and "\n" not in statement:
+                        continue
+                    
+                    # Remove leading comment lines from the statement
+                    lines = statement.split('\n')
+                    cleaned_lines = []
+                    for line in lines:
+                        stripped = line.strip()
+                        if stripped and not stripped.startswith("--"):
+                            cleaned_lines.append(line)
+                        elif not stripped:
+                            # Keep empty lines for formatting
+                            cleaned_lines.append(line)
+                    statement = '\n'.join(cleaned_lines).strip()
+                    
+                    if not statement:
                         continue
 
                     desc = f"{migration_name} (statement {i}/{len(statements)})"
@@ -447,6 +698,22 @@ def main():
     parser.add_argument("--schema", default="sec_raw", help="Snowflake schema name (default: sec_raw)")
     parser.add_argument("--dry-run", action="store_true", help="Dry run mode (don't execute SQL)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
+    parser.add_argument(
+        "--rollback",
+        type=str,
+        metavar="MIGRATION_NAME",
+        help="Rollback a specific migration (e.g., 202512221000__create_submissions.sql)",
+    )
+    parser.add_argument(
+        "--rollback-one",
+        action="store_true",
+        help="Rollback the most recent migration (one at a time)",
+    )
+    parser.add_argument(
+        "--migrate-one",
+        action="store_true",
+        help="Run only the next pending migration (one at a time)",
+    )
 
     args = parser.parse_args()
 
@@ -474,7 +741,7 @@ def main():
         logger.error(f"Migrations directory not found: {args.migrations_dir}")
         sys.exit(1)
 
-    # Deploy
+    # Deploy or rollback
     migrator = SnowflakeMigrator(
         account=config["account"],
         user=config["user"],
@@ -488,9 +755,34 @@ def main():
 
     try:
         migrator.connect()
-        migrator.deploy(args.migrations_dir)
+
+        if args.rollback:
+            # Rollback specific migration
+            migrator.rollback_migration(args.rollback)
+        elif args.rollback_one:
+            # Rollback the most recent migration
+            latest = migrator.get_latest_migration()
+            if not latest:
+                logger.warning("No executed migrations found")
+                sys.exit(0)
+
+            logger.info(f"Most recent migration: {latest}")
+            if not args.dry_run:
+                response = input(f"Rollback migration {latest}? (yes/no): ")
+                if response.lower() != "yes":
+                    logger.info("Aborted.")
+                    sys.exit(0)
+
+            migrator.rollback_migration(latest)
+        elif args.migrate_one:
+            # Deploy only the next pending migration
+            migrator.deploy_one(args.migrations_dir)
+        else:
+            # Deploy all pending migrations
+            migrator.deploy(args.migrations_dir)
+
     except Exception as e:
-        logger.error(f"Migration deployment failed: {e}")
+        logger.error(f"Operation failed: {e}")
         sys.exit(1)
     finally:
         migrator.close()

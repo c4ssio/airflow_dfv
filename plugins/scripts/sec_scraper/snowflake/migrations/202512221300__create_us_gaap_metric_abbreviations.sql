@@ -95,16 +95,16 @@ SELECT
     f.*,
     COALESCE(a.abbreviation, f.metric_name) AS metric_abbrev,
     a.category AS metric_category,
-    a.description AS metric_description
+    a.description AS abbreviation_description
 FROM 
     sec_raw.companyfacts_facts f
     LEFT JOIN sec_raw.us_gaap_metric_abbreviations a
         ON f.metric_name = a.metric_name
 ;
 
-COMMENT ON VIEW sec_raw.companyfacts_facts_with_abbrev IS 
-'Company facts with metric abbreviations. Use metric_abbrev for shorter column names in queries.
-Example: SELECT cik, period_end, metric_abbrev, value FROM ... WHERE metric_abbrev = ''EPS_Basic''';
+-- Note: Snowflake doesn't support COMMENT ON VIEW. View description:
+-- Company facts with metric abbreviations. Use metric_abbrev for shorter column names in queries.
+-- Example: SELECT cik, period_end, metric_abbrev, value FROM ... WHERE metric_abbrev = 'EPS_Basic'
 
 -- Example queries:
 --

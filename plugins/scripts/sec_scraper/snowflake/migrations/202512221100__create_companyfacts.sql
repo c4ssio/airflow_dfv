@@ -50,15 +50,9 @@ CREATE OR REPLACE TABLE sec_raw.companyfacts_facts (
 )
 COMMENT = 'Individual metric values from SEC EDGAR company facts. One row per metric value per reporting period.';
 
--- Indexes for common queries
-CREATE INDEX IF NOT EXISTS idx_companyfacts_cik_period 
-    ON sec_raw.companyfacts_facts (cik, period_end DESC);
-
-CREATE INDEX IF NOT EXISTS idx_companyfacts_metric 
-    ON sec_raw.companyfacts_facts (taxonomy, metric_name);
-
-CREATE INDEX IF NOT EXISTS idx_companyfacts_fiscal_year 
-    ON sec_raw.companyfacts_facts (cik, fiscal_year DESC, fiscal_period);
+-- Note: Snowflake doesn't support CREATE INDEX. Use clustering keys for performance:
+-- ALTER TABLE sec_raw.companyfacts_facts CLUSTER BY (cik, period_end);
+-- ALTER TABLE sec_raw.companyfacts_facts CLUSTER BY (taxonomy, metric_name);
 
 -- Metric Abbreviations:
 -- For easier querying, use the us_gaap_metric_abbreviations table and the 

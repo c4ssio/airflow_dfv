@@ -1,160 +1,197 @@
-# Snowflake Migration Deployment
+# Snowflake Migration System
 
-This directory contains scripts to deploy SEC scraper migrations to Snowflake.
-The migration system tracks which migrations have been executed to prevent re-running them.
+This directory contains SQL migration files and scripts to manage the Snowflake schema for the SEC scraper project.
 
-## Prerequisites
+## Files
 
-1. Install `snowflake-connector-python`:
+- `migrations/` - SQL migration files (YYYYMMDDHHMM__description.sql format)
+- `deploy_migrations.py` - Main script to deploy migrations (supports one-at-a-time options)
+- `cleanup_schema.py` - Script to drop all objects in the schema
+- `*.sh` - Convenience shell scripts for common operations
+- `config.example.json` - Example configuration file
+- `SYNTAX.md` - Quick reference for all commands
+
+## Setup
+
+1. **Create configuration file:**
    ```bash
-   pip install snowflake-connector-python
+   cp config.example.json ../../../../config/snowflake.json
+   # Edit config/snowflake.json with your Snowflake credentials
    ```
 
-2. Configure Snowflake connection (see Configuration below)
-
-## Configuration
-
-You can configure Snowflake connection in two ways:
-
-### Option 1: Environment Variables (Recommended)
-
-Set these environment variables:
-
-```bash
-export SNOWFLAKE_ACCOUNT="your-account.snowflakecomputing.com"
-export SNOWFLAKE_USER="your-username"
-export SNOWFLAKE_PASSWORD="your-password"
-export SNOWFLAKE_WAREHOUSE="COMPUTE_WH"
-export SNOWFLAKE_DATABASE="YOUR_DATABASE"
-export SNOWFLAKE_SCHEMA="sec_raw"  # Optional, defaults to sec_raw
-export SNOWFLAKE_ROLE="ACCOUNTADMIN"  # Optional
-```
-
-### Option 2: Config File (Recommended)
-
-1. Copy the example config to the `config/` folder:
+2. **Set up virtual environment (if not already done):**
    ```bash
-   cp config/snowflake.json.example config/snowflake.json
+   ../../../../scripts/setup_venv.sh
    ```
 
-2. Edit `config/snowflake.json` with your Snowflake credentials
+## Quick Start Scripts
 
-3. The script will automatically find `config/snowflake.json` (or use `--config` to specify a different path)
-
-**Note:** `config/snowflake.json` is gitignored - never commit credentials! The `.example` file is safe to commit.
-
-## Migration Files
-
-Migration files are located in `plugins/scripts/sec_scraper/snowflake/migrations/` and follow the naming pattern:
-- `YYYYMMDD__description.sql` (e.g., `20251222__create_submissions.sql`)
-
-Migrations are executed in chronological order (by date prefix, then filename).
-
-## Usage
-
-### From Local Machine
+### Cleanup Schema (Drop Everything)
 
 ```bash
-# Dry run (see what would be executed)
-python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --dry-run
+# Dry run to preview
+./cleanup_schema.sh --dry-run
 
-# Deploy pending migrations to default schema (sec_raw)
-python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py
-
-# Deploy to custom schema
-python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --schema my_schema
-
-# Use config file (defaults to config/snowflake.json)
-python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py
-
-# Or specify a different config file
-python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --config /path/to/config.json
-
-# Verbose output
-python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --verbose
+# Actually clean up (requires confirmation)
+./cleanup_schema.sh
 ```
 
-### From Airflow Container
+### Run All Migrations
 
 ```bash
-# Enter the container
-docker compose exec airflow-scheduler bash
+# Dry run to preview
+./run_migrations.sh --dry-run
 
-# Set environment variables (or use Airflow connections)
-export SNOWFLAKE_ACCOUNT="..."
-export SNOWFLAKE_USER="..."
-# ... etc
-
-# Run deployment
-python /opt/airflow/plugins/scripts/sec_scraper/snowflake/deploy_migrations.py
+# Run all pending migrations
+./run_migrations.sh
 ```
 
-### Using Airflow Connections (Recommended for Production)
 
-1. Create a Snowflake connection in Airflow UI:
-   - Connection Id: `snowflake_default`
-   - Connection Type: `Snowflake`
-   - Fill in account, user, password, warehouse, database, schema
+## Usage (Python Scripts Directly)
 
-2. Modify the script to use Airflow's connection (or use Airflow's SnowflakeHook)
+### Deploy All Pending Migrations
+
+```bash
+# Using the venv helper script
+../../../../scripts/run_with_venv.sh python deploy_migrations.py
+
+# Or activate venv manually
+source ../../../../.venv/bin/activate
+python deploy_migrations.py
+```
+
+### Dry Run (Preview Changes)
+
+```bash
+python deploy_migrations.py --dry-run
+```
+
+### Rollback a Specific Migration
+
+Rollback a migration by dropping the objects it created and removing its tracking record:
+
+```bash
+python deploy_migrations.py --rollback 202512221000__create_submissions.sql
+```
+
+**Note:** Rollback automatically extracts object names (tables/views) from the migration SQL and drops them. It will:
+1. Drop views first (they may depend on tables)
+2. Drop tables
+3. Remove the migration record from `schema_migrations` table
+
+### Clean Up Entire Schema
+
+**WARNING:** This will delete ALL tables and views in the schema!
+
+```bash
+# Dry run first to see what will be deleted
+python cleanup_schema.py --dry-run
+
+# Actually clean up (requires confirmation)
+python cleanup_schema.py
+```
+
+### Re-run All Migrations from Scratch
+
+If you need to start fresh:
+
+```bash
+# 1. Clean up everything
+./cleanup_schema.sh
+
+# 2. Re-run all migrations
+./run_migrations.sh
+```
+
+## Migration File Format
+
+Migration files must follow this naming convention:
+```
+YYYYMMDDHHMM__description.sql
+```
+
+Or the older format (still supported):
+```
+YYYYMMDD__description.sql
+```
+
+Example: `202512221000__create_submissions.sql`
+
+The migration system:
+- Executes migrations in chronological order (by date/timestamp prefix)
+- Tracks executed migrations in `schema_migrations` table
+- Skips already-executed migrations (unless file content changed)
+- Supports `CREATE OR REPLACE` statements for idempotency
+
+**Note:** The `HHMM` (hours and minutes) format ensures migrations run in the exact order you specify, even if multiple migrations are created on the same day.
 
 ## Migration Tracking
 
-The migration system:
-- Tracks executed migrations in `{schema}.schema_migrations` table
-- Prevents re-running migrations that have already been executed
-- Detects modified migrations (checksum changes) and re-runs them with a warning
-- Records execution time, success/failure, and error messages
-- Each migration is identified by filename and checksum
+The system creates a `schema_migrations` table to track:
+- Migration name
+- Execution timestamp
+- SQL checksum (to detect file changes)
+- Success/failure status
 
-**Note:** The old `deploy_schemas.py` script is deprecated. Use `deploy_migrations.py` instead.
+## Rollback Behavior
 
-## Migration Files
+### Rolling Back One at a Time
 
-Migration files are in `plugins/scripts/sec_scraper/snowflake/migrations/` and are executed in chronological order:
+```bash
+python deploy_migrations.py --rollback-one
+```
 
-1. `20251222__create_submissions.sql` - Company submissions metadata table
-2. `20251222__create_companyfacts.sql` - Company facts tables (metadata + facts)
-3. `20251222__create_us_gaap_metric_abbreviations.sql` - Metric abbreviation mapping table
-4. `20251222__create_submissions_ticker_mapping.sql` - Ticker/exchange mapping view
+This will:
+- Find the most recently executed migration
+- Ask for confirmation
+- Drop all objects created by that migration
+- Remove the migration record
 
-## Schema Structure
+### Rolling Back a Specific Migration
 
-The deployment creates:
+```bash
+python deploy_migrations.py --rollback MIGRATION_NAME.sql
+```
 
-- **Tables:**
-  - `sec_raw.submissions` - Company submission metadata
-  - `sec_raw.companyfacts_metadata` - Company facts metadata
-  - `sec_raw.companyfacts_facts` - Individual metric values (normalized)
-  - `sec_raw.companyfacts_variant` - Company facts as VARIANT (alternative)
-  - `sec_raw.us_gaap_metric_abbreviations` - Metric abbreviation mappings
+When rolling back a migration:
+- Objects are dropped in reverse order (views before tables)
+- The migration record is removed from tracking
+- If objects don't exist, warnings are logged but execution continues
+- Rollback does NOT automatically rollback dependent migrations
 
-- **Views:**
-  - `sec_raw.submissions_ticker_mapping` - Normalized ticker/exchange mapping
-  - `sec_raw.companyfacts_facts_with_abbrev` - Facts with abbreviations joined
+**Important:** Rollback extracts object names from `CREATE TABLE` and `CREATE VIEW` statements. If your migration creates objects with different patterns, you may need to manually drop them.
+
+## Configuration
+
+Configuration can be provided via:
+1. JSON config file (default: `../../../../config/snowflake.json`)
+2. Environment variables (override config file):
+   - `SNOWFLAKE_ACCOUNT`
+   - `SNOWFLAKE_USER`
+   - `SNOWFLAKE_PASSWORD`
+   - `SNOWFLAKE_WAREHOUSE`
+   - `SNOWFLAKE_DATABASE`
+   - `SNOWFLAKE_SCHEMA` (default: `sec_raw`)
+   - `SNOWFLAKE_ROLE` (optional)
 
 ## Troubleshooting
 
-### Connection Issues
+### Migration Fails Partway Through
 
-- Verify your account format: `account.snowflakecomputing.com` (not just `account`)
-- Check that your user has permissions to create schemas and tables
-- Ensure warehouse is running: `ALTER WAREHOUSE COMPUTE_WH RESUME;`
+If a migration fails partway through:
+1. Fix the migration file
+2. Rollback the failed migration: `python deploy_migrations.py --rollback MIGRATION_NAME.sql`
+3. Re-run migrations: `./run_migrations.sh`
 
-### Permission Errors
+### Objects Not Created
 
-- Ensure your role has `CREATE SCHEMA` and `CREATE TABLE` permissions
-- You may need `USAGE` on the database: `GRANT USAGE ON DATABASE YOUR_DATABASE TO ROLE YOUR_ROLE;`
+If objects aren't created despite migration showing success:
+1. Check the `schema_migrations` table for execution records
+2. Verify SQL statements are being split correctly (check logs)
+3. Try rolling back and re-running: `python deploy_migrations.py --rollback MIGRATION_NAME.sql && ./run_migrations.sh`
 
-### SQL Errors
+### Schema Out of Sync
 
-- Check that all SQL files are valid Snowflake DDL
-- Some features may require specific Snowflake edition (e.g., VARIANT support)
-
-## Security Notes
-
-- Never commit `config.json` or credentials to git
-- Use environment variables or Airflow connections in production
-- Consider using key pair authentication instead of passwords
-- Use least-privilege roles (not ACCOUNTADMIN) in production
-
+If your schema is out of sync:
+1. Clean up everything: `./cleanup_schema.sh`
+2. Re-run all migrations: `./run_migrations.sh`
