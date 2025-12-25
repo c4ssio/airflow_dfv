@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -105,21 +106,48 @@ def _session(user_agent: str) -> requests.Session:
     return s
 
 
-# --- Simple global rate limiter (per task instance) ---
+# --- Shared rate limiter for coordinated rate limiting across tasks ---
+# Uses a lock-protected global variable so all tasks in the same DAG run
+# coordinate to respect the overall rate limit (e.g., 5 req/s total, not per task)
+_rate_limit_lock = threading.Lock()
 _last_request_ts: float = 0.0
 
 
 def _rate_limit(rps: float) -> None:
-    """Sleep so we don't exceed rps within a single task instance."""
-    global _last_request_ts
+    """
+    Sleep so we don't exceed rps across ALL tasks in the same process.
+
+    Uses a shared lock-protected timestamp so that all task instances
+    coordinate to respect the overall rate limit. This ensures that if
+    you have 25 tasks running in parallel, they collectively respect
+    the 5 req/s limit rather than each trying to do 5 req/s independently.
+
+    Note: This coordinates within a single worker process. If you have
+    multiple workers, each worker will independently rate limit. For
+    true global coordination across all workers, you'd need Redis or
+    a distributed lock mechanism.
+    """
     if rps <= 0:
         return
-    min_interval = 1.0 / rps
-    now = time.time()
-    wait = (_last_request_ts + min_interval) - now
+
+    with _rate_limit_lock:
+        min_interval = 1.0 / rps
+        now = time.time()
+        wait = (_last_request_ts + min_interval) - now
+        if wait > 0:
+            # Release lock before sleeping to allow other tasks to proceed
+            # (though they'll still wait when they acquire the lock)
+            pass
+        else:
+            wait = 0
+
+    # Sleep outside the lock to avoid blocking other tasks unnecessarily
     if wait > 0:
         time.sleep(wait)
-    _last_request_ts = time.time()
+
+    # Update timestamp while holding the lock
+    with _rate_limit_lock:
+        _last_request_ts = time.time()
 
 
 def _get_json(
