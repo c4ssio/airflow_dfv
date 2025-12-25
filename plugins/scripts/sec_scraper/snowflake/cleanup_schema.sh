@@ -10,9 +10,11 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../../../" && pwd)"
 cd "$PROJECT_ROOT"
 
 # Use the venv if it exists
-if [ -d ".venv" ]; then
-    .venv/bin/python "$SCRIPT_DIR/cleanup_schema.py" "$@"
+if [ -d "venv" ]; then
+    venv/bin/python "$SCRIPT_DIR/cleanup_schema.py" "$@"
 else
-    python3 "$SCRIPT_DIR/cleanup_schema.py" "$@"
+    echo "Error: Virtual environment 'venv' not found."
+    echo "Please run ../../../../scripts/setup_venv.sh first."
+    exit 1
 fi
 

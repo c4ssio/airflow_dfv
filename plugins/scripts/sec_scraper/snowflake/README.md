@@ -9,69 +9,79 @@ This directory contains SQL migration files and scripts to manage the Snowflake 
 - `cleanup_schema.py` - Script to drop all objects in the schema
 - `*.sh` - Convenience shell scripts for common operations
 - `config.example.json` - Example configuration file
-- `SYNTAX.md` - Quick reference for all commands
 
 ## Setup
 
-1. **Create configuration file:**
+**Note:** All commands assume you are in the `airflow_dfv` project root directory.
+
+1. **Set up virtual environment (required):**
    ```bash
-   cp config.example.json ../../../../config/snowflake.json
+   ./scripts/setup_venv.sh
+   ```
+
+2. **Create configuration file:**
+   ```bash
+   cp plugins/scripts/sec_scraper/snowflake/config.example.json config/snowflake.json
    # Edit config/snowflake.json with your Snowflake credentials
    ```
 
-2. **Set up virtual environment (if not already done):**
-   ```bash
-   ../../../../scripts/setup_venv.sh
-   ```
+**Note:** All Python scripts must be run with the virtual environment activated. The shell scripts handle this automatically.
 
-## Quick Start Scripts
+## Quick Commands
 
 ### Cleanup Schema (Drop Everything)
 
 ```bash
 # Dry run to preview
-./cleanup_schema.sh --dry-run
+./plugins/scripts/sec_scraper/snowflake/cleanup_schema.sh --dry-run
 
 # Actually clean up (requires confirmation)
-./cleanup_schema.sh
+./plugins/scripts/sec_scraper/snowflake/cleanup_schema.sh
 ```
 
 ### Run All Migrations
 
 ```bash
 # Dry run to preview
-./run_migrations.sh --dry-run
+./plugins/scripts/sec_scraper/snowflake/run_migrations.sh --dry-run
 
 # Run all pending migrations
-./run_migrations.sh
+./plugins/scripts/sec_scraper/snowflake/run_migrations.sh
 ```
 
+## Deploy Migrations Options
 
-## Usage (Python Scripts Directly)
-
-### Deploy All Pending Migrations
+### Run All Pending Migrations (Default)
 
 ```bash
-# Using the venv helper script
-../../../../scripts/run_with_venv.sh python deploy_migrations.py
-
-# Or activate venv manually
-source ../../../../.venv/bin/activate
-python deploy_migrations.py
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --dry-run
 ```
 
-### Dry Run (Preview Changes)
+### Run One Migration at a Time (Migrate Up)
 
 ```bash
-python deploy_migrations.py --dry-run
+# Preview the next migration
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --migrate-one --dry-run
+
+# Run only the next pending migration
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --migrate-one
 ```
 
-### Rollback a Specific Migration
-
-Rollback a migration by dropping the objects it created and removing its tracking record:
+### Rollback One Migration at a Time (Migrate Down)
 
 ```bash
-python deploy_migrations.py --rollback 202512221000__create_submissions.sql
+# Preview what would be rolled back
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --rollback-one --dry-run
+
+# Rollback the most recent migration (requires confirmation)
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --rollback-one
+```
+
+### Rollback Specific Migration
+
+```bash
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --rollback 202512221000__create_submissions.sql
 ```
 
 **Note:** Rollback automatically extracts object names (tables/views) from the migration SQL and drops them. It will:
@@ -79,28 +89,37 @@ python deploy_migrations.py --rollback 202512221000__create_submissions.sql
 2. Drop tables
 3. Remove the migration record from `schema_migrations` table
 
-### Clean Up Entire Schema
+## Common Workflows
 
-**WARNING:** This will delete ALL tables and views in the schema!
+### Complete Reset
 
 ```bash
-# Dry run first to see what will be deleted
-python cleanup_schema.py --dry-run
-
-# Actually clean up (requires confirmation)
-python cleanup_schema.py
+./plugins/scripts/sec_scraper/snowflake/cleanup_schema.sh      # Drop everything
+./plugins/scripts/sec_scraper/snowflake/run_migrations.sh      # Re-run all migrations
 ```
 
-### Re-run All Migrations from Scratch
-
-If you need to start fresh:
+### Step-by-Step Migration
 
 ```bash
-# 1. Clean up everything
-./cleanup_schema.sh
+# Run migrations one at a time
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --migrate-one
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --migrate-one
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --migrate-one
 
-# 2. Re-run all migrations
-./run_migrations.sh
+# Rollback one at a time if needed
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --rollback-one
+```
+
+### Fix a Failed Migration
+
+```bash
+# 1. Rollback the failed migration
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --rollback-one
+
+# 2. Fix the migration file
+
+# 3. Re-run it
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --migrate-one
 ```
 
 ## Migration File Format
@@ -138,7 +157,7 @@ The system creates a `schema_migrations` table to track:
 ### Rolling Back One at a Time
 
 ```bash
-python deploy_migrations.py --rollback-one
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --rollback-one
 ```
 
 This will:
@@ -150,7 +169,7 @@ This will:
 ### Rolling Back a Specific Migration
 
 ```bash
-python deploy_migrations.py --rollback MIGRATION_NAME.sql
+python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --rollback MIGRATION_NAME.sql
 ```
 
 When rolling back a migration:
@@ -161,10 +180,20 @@ When rolling back a migration:
 
 **Important:** Rollback extracts object names from `CREATE TABLE` and `CREATE VIEW` statements. If your migration creates objects with different patterns, you may need to manually drop them.
 
+## Options Reference
+
+- `--migrate-one` - Run only the next pending migration (one at a time)
+- `--rollback-one` - Rollback the most recent migration (one at a time)
+- `--rollback MIGRATION_NAME` - Rollback a specific migration by name
+- `--dry-run` - Preview changes without executing
+- `--schema SCHEMA_NAME` - Specify schema (default: sec_raw)
+- `--config PATH` - Specify config file path
+- `--verbose` or `-v` - Verbose logging
+
 ## Configuration
 
 Configuration can be provided via:
-1. JSON config file (default: `../../../../config/snowflake.json`)
+1. JSON config file (default: `config/snowflake.json`)
 2. Environment variables (override config file):
    - `SNOWFLAKE_ACCOUNT`
    - `SNOWFLAKE_USER`
@@ -180,18 +209,18 @@ Configuration can be provided via:
 
 If a migration fails partway through:
 1. Fix the migration file
-2. Rollback the failed migration: `python deploy_migrations.py --rollback MIGRATION_NAME.sql`
-3. Re-run migrations: `./run_migrations.sh`
+2. Rollback the failed migration: `python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --rollback MIGRATION_NAME.sql`
+3. Re-run migrations: `./plugins/scripts/sec_scraper/snowflake/run_migrations.sh`
 
 ### Objects Not Created
 
 If objects aren't created despite migration showing success:
 1. Check the `schema_migrations` table for execution records
 2. Verify SQL statements are being split correctly (check logs)
-3. Try rolling back and re-running: `python deploy_migrations.py --rollback MIGRATION_NAME.sql && ./run_migrations.sh`
+3. Try rolling back and re-running: `python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py --rollback MIGRATION_NAME.sql && ./plugins/scripts/sec_scraper/snowflake/run_migrations.sh`
 
 ### Schema Out of Sync
 
 If your schema is out of sync:
-1. Clean up everything: `./cleanup_schema.sh`
-2. Re-run all migrations: `./run_migrations.sh`
+1. Clean up everything: `./plugins/scripts/sec_scraper/snowflake/cleanup_schema.sh`
+2. Re-run all migrations: `./plugins/scripts/sec_scraper/snowflake/run_migrations.sh`

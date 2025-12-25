@@ -5,7 +5,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-VENV_DIR="$PROJECT_ROOT/.venv"
+VENV_DIR="$PROJECT_ROOT/venv"
 
 echo "Setting up virtual environment for airflow_dfv..."
 
@@ -36,7 +36,7 @@ echo ""
 echo "✓ Virtual environment setup complete!"
 echo ""
 echo "To activate it manually:"
-echo "  source .venv/bin/activate"
+echo "  source venv/bin/activate"
 echo ""
 echo "Or use the helper script:"
 echo "  ./scripts/run_with_venv.sh python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py"

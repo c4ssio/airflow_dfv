@@ -5,7 +5,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-VENV_DIR="$PROJECT_ROOT/.venv"
+VENV_DIR="$PROJECT_ROOT/venv"
 
 # Activate venv if it exists
 if [ -d "$VENV_DIR" ]; then
@@ -13,7 +13,7 @@ if [ -d "$VENV_DIR" ]; then
     echo "✓ Activated virtual environment: $VENV_DIR"
 else
     echo "✗ Virtual environment not found at $VENV_DIR"
-    echo "  Create it with: python3 -m venv .venv"
+    echo "  Create it with: ./scripts/setup_venv.sh"
     exit 1
 fi
 
