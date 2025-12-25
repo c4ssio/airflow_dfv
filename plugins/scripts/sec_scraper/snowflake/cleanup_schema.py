@@ -10,9 +10,7 @@ Usage:
 """
 
 import argparse
-import json
 import logging
-import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -28,23 +26,19 @@ logger = logging.getLogger(__name__)
 
 
 def load_config(config_file: Optional[Path] = None) -> dict:
-    """Load configuration from file or environment variables."""
-    config = {}
+    """Load configuration from YAML file."""
+    if not config_file or not config_file.exists():
+        raise FileNotFoundError(f"Configuration file not found: {config_file}")
 
-    # Try to load from config file first
-    if config_file and config_file.exists():
-        with open(config_file, "r") as f:
-            config = json.load(f)
-        logger.info(f"Loaded config from {config_file}")
+    import yaml
 
-    # Environment variables override config file
-    config["account"] = os.environ.get("SNOWFLAKE_ACCOUNT") or config.get("account")
-    config["user"] = os.environ.get("SNOWFLAKE_USER") or config.get("user")
-    config["password"] = os.environ.get("SNOWFLAKE_PASSWORD") or config.get("password")
-    config["warehouse"] = os.environ.get("SNOWFLAKE_WAREHOUSE") or config.get("warehouse")
-    config["database"] = os.environ.get("SNOWFLAKE_DATABASE") or config.get("database")
-    config["schema"] = os.environ.get("SNOWFLAKE_SCHEMA", "sec_raw") or config.get("schema", "sec_raw")
-    config["role"] = os.environ.get("SNOWFLAKE_ROLE") or config.get("role")
+    with open(config_file, "r") as f:
+        config = yaml.safe_load(f)
+    logger.info(f"Loaded config from {config_file}")
+
+    # Set default schema if not provided
+    if "schema" not in config:
+        config["schema"] = "sec_raw"
 
     return config
 
@@ -112,8 +106,8 @@ Example:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path(__file__).parent.parent.parent.parent.parent / "config" / "snowflake.json",
-        help="Path to JSON config file (default: ../../../../config/snowflake.json)",
+        default=Path(__file__).parent.parent.parent.parent.parent / "config" / "snowflake.yaml",
+        help="Path to YAML config file (default: ../../../../config/snowflake.yaml)",
     )
     parser.add_argument("--schema", default="sec_raw", help="Snowflake schema name (default: sec_raw)")
     parser.add_argument("--dry-run", action="store_true", help="Dry run mode (don't execute SQL)")
@@ -137,7 +131,7 @@ Example:
     missing = [k for k in required if not config.get(k)]
     if missing:
         logger.error(f"Missing required configuration: {', '.join(missing)}")
-        logger.error("Set via environment variables or --config file")
+        logger.error(f"Please check your config file: {args.config}")
         sys.exit(1)
 
     # Confirm (unless dry-run)

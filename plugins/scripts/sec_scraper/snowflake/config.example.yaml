@@ -1,0 +1,11 @@
+# Snowflake connection configuration
+# Copy this file to config/snowflake.yaml and fill in your actual credentials
+
+account: "your-account-identifier"  # e.g., "xy12345.us-east-1"
+user: "your-username"
+password: "your-password"
+warehouse: "COMPUTE_WH"  # Your Snowflake warehouse name
+database: "YOUR_DATABASE"  # Your Snowflake database name
+schema: "sec_raw"  # Default schema for migrations (optional, defaults to sec_raw)
+role: "ACCOUNTADMIN"  # Optional: Snowflake role to use
+

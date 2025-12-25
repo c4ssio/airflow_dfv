@@ -8,7 +8,7 @@ This directory contains SQL migration files and scripts to manage the Snowflake 
 - `deploy_migrations.py` - Main script to deploy migrations (supports one-at-a-time options)
 - `cleanup_schema.py` - Script to drop all objects in the schema
 - `*.sh` - Convenience shell scripts for common operations
-- `config.example.json` - Example configuration file
+- `config.example.yaml` - Example configuration file
 
 ## Setup
 
@@ -21,8 +21,8 @@ This directory contains SQL migration files and scripts to manage the Snowflake 
 
 2. **Create configuration file:**
    ```bash
-   cp plugins/scripts/sec_scraper/snowflake/config.example.json config/snowflake.json
-   # Edit config/snowflake.json with your Snowflake credentials
+   cp plugins/scripts/sec_scraper/snowflake/config.example.yaml config/snowflake.yaml
+   # Edit config/snowflake.yaml with your Snowflake credentials
    ```
 
 **Note:** All Python scripts must be run with the virtual environment activated. The shell scripts handle this automatically.
@@ -129,11 +129,6 @@ Migration files must follow this naming convention:
 YYYYMMDDHHMM__description.sql
 ```
 
-Or the older format (still supported):
-```
-YYYYMMDD__description.sql
-```
-
 Example: `202512221000__create_submissions.sql`
 
 The migration system:
@@ -192,16 +187,16 @@ When rolling back a migration:
 
 ## Configuration
 
-Configuration can be provided via:
-1. JSON config file (default: `config/snowflake.json`)
-2. Environment variables (override config file):
-   - `SNOWFLAKE_ACCOUNT`
-   - `SNOWFLAKE_USER`
-   - `SNOWFLAKE_PASSWORD`
-   - `SNOWFLAKE_WAREHOUSE`
-   - `SNOWFLAKE_DATABASE`
-   - `SNOWFLAKE_SCHEMA` (default: `sec_raw`)
-   - `SNOWFLAKE_ROLE` (optional)
+Configuration is provided via a YAML config file (default: `config/snowflake.yaml`).
+
+The config file should contain:
+- `account` - Snowflake account identifier
+- `user` - Snowflake username
+- `password` - Snowflake password
+- `warehouse` - Snowflake warehouse name
+- `database` - Snowflake database name
+- `schema` - Snowflake schema name (default: `sec_raw`)
+- `role` - Snowflake role (optional)
 
 ## Troubleshooting
 
