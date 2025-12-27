@@ -440,31 +440,46 @@ with DAG(
                 cik,
                 mem_before_facts,
             )
-            facts = _get_json(s, facts_url, cfg.timeout_s, cfg.rps, log_memory=True)
-            mem_after_facts = _get_memory_mb()
-            logger.info(
-                "CIK %s: Loaded companyfacts.json. Memory: %.1f MB (delta: +%.1f MB)",
-                cik,
-                mem_after_facts,
-                mem_after_facts - mem_before_facts,
-            )
-            facts_bytes = json.dumps(facts, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-            logger.info(
-                "CIK %s: Encoded companyfacts to bytes. Size: %.1f MB",
-                cik,
-                len(facts_bytes) / 1024.0 / 1024.0,
-            )
-            # Clear the facts dict from memory after encoding (help GC)
-            del facts
-            gc.collect()
-            mem_after_encode = _get_memory_mb()
-            logger.info(
-                "CIK %s: After encoding and GC. Memory: %.1f MB (freed %.1f MB)",
-                cik,
-                mem_after_encode,
-                mem_after_facts - mem_after_encode,
-            )
-            existing_facts_path = None
+            try:
+                facts = _get_json(s, facts_url, cfg.timeout_s, cfg.rps, log_memory=True)
+                mem_after_facts = _get_memory_mb()
+                logger.info(
+                    "CIK %s: Loaded companyfacts.json. Memory: %.1f MB (delta: +%.1f MB)",
+                    cik,
+                    mem_after_facts,
+                    mem_after_facts - mem_before_facts,
+                )
+                facts_bytes = json.dumps(facts, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+                logger.info(
+                    "CIK %s: Encoded companyfacts to bytes. Size: %.1f MB",
+                    cik,
+                    len(facts_bytes) / 1024.0 / 1024.0,
+                )
+                # Clear the facts dict from memory after encoding (help GC)
+                del facts
+                gc.collect()
+                mem_after_encode = _get_memory_mb()
+                logger.info(
+                    "CIK %s: After encoding and GC. Memory: %.1f MB (freed %.1f MB)",
+                    cik,
+                    mem_after_encode,
+                    mem_after_facts - mem_after_encode,
+                )
+                existing_facts_path = None
+            except AirflowFailException as e:
+                # Check if it's a 404 - some companies don't have XBRL data
+                error_msg = str(e)
+                if "status=404" in error_msg or "(status=404)" in error_msg or "status= 404" in error_msg:
+                    logger.warning(
+                        "CIK %s: companyfacts.json not available (404). This company may not have XBRL data. Continuing without it.",
+                        cik,
+                    )
+                    facts_bytes = None
+                    existing_facts_path = None
+                    needs_facts_download = False
+                else:
+                    # Re-raise for other errors (rate limiting, 5xx, etc.)
+                    raise
         else:
             # Reuse existing companyfacts.json - don't download or copy
             facts_bytes = None
