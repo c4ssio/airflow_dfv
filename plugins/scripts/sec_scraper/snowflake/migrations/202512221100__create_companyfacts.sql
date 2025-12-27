@@ -59,7 +59,7 @@ COMMENT = 'Individual metric values from SEC EDGAR company facts. One row per me
 -- companyfacts_facts_with_abbrev view. Common abbreviations include:
 --   EPS_Basic, EPS_Diluted, NI (Net Income), REV (Revenue), ASSETS, EQUITY,
 --   CFO (Cash Flow from Operations), ROE, ROA, etc.
--- See schemas/sec_raw/us_gaap_metric_abbreviations.sql for the full mapping.
+-- See the us_gaap_metric_abbreviations migration for the full mapping.
 
 -- Notes on common US-GAAP metrics:
 -- Common metric names include (there are 464+ possible metrics):

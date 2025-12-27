@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import resource
 import threading
 import time
 from dataclasses import dataclass
@@ -127,6 +128,8 @@ def _rate_limit(rps: float) -> None:
     true global coordination across all workers, you'd need Redis or
     a distributed lock mechanism.
     """
+    global _last_request_ts
+    
     if rps <= 0:
         return
 
@@ -150,22 +153,52 @@ def _rate_limit(rps: float) -> None:
         _last_request_ts = time.time()
 
 
+def _get_memory_mb() -> float:
+    """Get current process memory usage in MB."""
+    try:
+        # Get RSS (Resident Set Size) in bytes, convert to MB
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+    except Exception:
+        return 0.0
+
+
 def _get_json(
     s: requests.Session,
     url: str,
     timeout_s: int,
     rps: float,
     max_attempts: int = 5,
+    log_memory: bool = False,
 ) -> Dict[str, Any]:
     """
     Robust GET with backoff on 429/5xx.
+    
+    Args:
+        log_memory: If True, log memory usage before and after loading JSON
     """
     backoff = 1.0
     for attempt in range(1, max_attempts + 1):
         _rate_limit(rps)
+        mem_before = _get_memory_mb() if log_memory else 0.0
         resp = s.get(url, timeout=timeout_s)
         if resp.status_code == 200:
-            return resp.json()
+            if log_memory:
+                logger.info(
+                    "Memory before JSON parse (%s): %.1f MB, Response size: %.1f MB",
+                    url,
+                    mem_before,
+                    len(resp.content) / 1024.0 / 1024.0,
+                )
+            data = resp.json()
+            if log_memory:
+                mem_after = _get_memory_mb()
+                logger.info(
+                    "Memory after JSON parse (%s): %.1f MB (delta: +%.1f MB)",
+                    url,
+                    mem_after,
+                    mem_after - mem_before,
+                )
+            return data
 
         # Retry on SEC rate limiting or transient errors
         if resp.status_code in (429, 500, 502, 503, 504):
@@ -339,8 +372,10 @@ with DAG(
                 existing_filing_date = _get_most_recent_filing_date(existing_submissions)
 
         # Always download submissions.json (it's relatively small and contains metadata)
-        submissions = _get_json(s, submissions_url, cfg.timeout_s, cfg.rps)
+        mem_start = _get_memory_mb()
+        submissions = _get_json(s, submissions_url, cfg.timeout_s, cfg.rps, log_memory=False)
         new_filing_date = _get_most_recent_filing_date(submissions)
+        mem_after_submissions = _get_memory_mb()
 
         # Only download companyfacts.json if there are new filings
         facts = None
@@ -358,8 +393,30 @@ with DAG(
                 )
 
         if needs_facts_download:
-            facts = _get_json(s, facts_url, cfg.timeout_s, cfg.rps)
+            # Log memory before downloading the large companyfacts.json file
+            logger.info(
+                "CIK %s: Downloading companyfacts.json. Memory before: %.1f MB",
+                cik,
+                _get_memory_mb(),
+            )
+            facts = _get_json(s, facts_url, cfg.timeout_s, cfg.rps, log_memory=True)
+            mem_after_facts = _get_memory_mb()
+            logger.info(
+                "CIK %s: Loaded companyfacts.json. Memory: %.1f MB (delta: +%.1f MB from start)",
+                cik,
+                mem_after_facts,
+                mem_after_facts - mem_start,
+            )
             facts_bytes = json.dumps(facts, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            # Clear the facts dict from memory after encoding (help GC)
+            del facts
+            mem_after_encode = _get_memory_mb()
+            logger.info(
+                "CIK %s: Encoded to bytes. Memory: %.1f MB (freed %.1f MB)",
+                cik,
+                mem_after_encode,
+                mem_after_facts - mem_after_encode,
+            )
             existing_facts_path = None
         else:
             # Reuse existing companyfacts.json - don't download or copy
@@ -367,6 +424,15 @@ with DAG(
             existing_facts_path = existing_data.get("companyfacts") if existing_data else None
 
         submissions_bytes = json.dumps(submissions, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        # Clear submissions dict after encoding
+        del submissions
+        mem_final = _get_memory_mb()
+        logger.info(
+            "CIK %s: Task complete. Final memory: %.1f MB (total delta: +%.1f MB)",
+            cik,
+            mem_final,
+            mem_final - mem_start,
+        )
 
         if cfg.s3_bucket:
             if S3Hook is None:

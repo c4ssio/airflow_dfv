@@ -109,6 +109,106 @@ docker compose start airflow-worker airflow-api-server airflow-scheduler
 
 ---
 
+### `check_worker_memory.sh`
+Monitors memory usage by process in the Airflow worker container.
+
+**Usage:**
+```bash
+./scripts/check_worker_memory.sh
+```
+
+**What it does:**
+- Shows container-level memory statistics
+- Lists top 10 processes by memory usage (RSS)
+- Provides detailed memory breakdown by process ID
+- Groups memory usage by process type (e.g., celery, python, airflow)
+- Shows Python/Celery-specific memory details
+- Displays system memory info and cgroup memory limits
+
+**When to use:**
+- Investigating memory leaks or high memory usage
+- Identifying which tasks/processes are consuming the most memory
+- Monitoring memory usage during task execution
+- Debugging out-of-memory errors
+
+**Note:** This script works without the `ps` command by reading from `/proc` directly, so it works with the base Airflow image without requiring additional packages.
+
+**Optional: Install `procps` for simpler commands**
+
+If you prefer using `ps` commands, you can install `procps` in your Dockerfile. This won't affect your Postgres database (it's a separate container). To do this:
+
+1. Update `Dockerfile`:
+```dockerfile
+FROM apache/airflow:3.1.5
+
+USER root
+RUN apt-get update && apt-get install -y procps && rm -rf /var/lib/apt/lists/*
+USER airflow
+
+COPY requirements.txt /requirements.txt
+RUN pip install --no-cache-dir -r /requirements.txt
+```
+
+2. Rebuild the image:
+```bash
+docker compose build
+docker compose up -d
+```
+
+**Quick one-liners (alternative to the script):**
+```bash
+# Get container name first
+CONTAINER=$(docker ps --format '{{.Names}}' | grep airflow-worker)
+
+# Container memory stats (updates every second)
+docker stats $CONTAINER
+
+# If procps is installed, you can also use:
+# docker exec $CONTAINER ps aux --sort=-%mem | head -11
+```
+
+---
+
+### `monitor_worker_memory.sh`
+Monitors memory usage over time to identify memory leaks and growth patterns.
+
+**Usage:**
+```bash
+./scripts/monitor_worker_memory.sh [interval_seconds] [count]
+```
+
+**Examples:**
+```bash
+# Monitor for 1 minute (10 second intervals, 6 samples)
+./scripts/monitor_worker_memory.sh 10 6
+
+# Monitor for 5 minutes (30 second intervals, 10 samples)
+./scripts/monitor_worker_memory.sh 30 10
+
+# Quick check: 20 seconds total (5 second intervals, 4 samples)
+./scripts/monitor_worker_memory.sh 5 4
+```
+
+**What it does:**
+- Takes multiple memory snapshots at specified intervals
+- Tracks memory usage per worker type (MainProcess, ForkPoolWorker-1, etc.)
+- Calculates min, max, and average memory per worker type
+- Saves a detailed timeline to `diagnostics/memory_timeline_YYYYMMDD_HHMMSS.txt`
+- Provides analysis and recommendations
+
+**When to use:**
+- Investigating memory leaks (run during task execution)
+- Understanding memory growth patterns
+- Identifying which worker types consume the most memory
+- Before and after optimizing tasks to measure improvement
+
+**Interpreting results:**
+- **MAX >> MIN**: Indicates memory growth during task execution (potential leak)
+- **Consistent growth over time**: Workers not releasing memory between tasks
+- **High average**: Consider reducing worker concurrency or optimizing tasks
+
+---
+
 ## Quick Reference
 
 | Script | Purpose | When to Use |
@@ -117,6 +217,8 @@ docker compose start airflow-worker airflow-api-server airflow-scheduler
 | `run_with_venv.sh` | Run commands with venv | Running Python scripts, migrations |
 | `check_airflow.sh` | Collect diagnostics | Troubleshooting, debugging |
 | `restart_airflow_services.sh` | Restart Airflow services | After config changes, stuck tasks |
+| `check_worker_memory.sh` | Snapshot of worker memory usage | Quick memory check, current state |
+| `monitor_worker_memory.sh` | Track memory over time | Memory leak detection, growth analysis |
 
 ## Prerequisites
 
