@@ -9,7 +9,7 @@ Environment variables (optional):
   Example: "drclive SEC scraper (you@drclive.net)"
 - SEC_REQUESTS_PER_SECOND: default 5  (keep <= 10; be polite)
 - SEC_TIMEOUT_SECONDS: default 30
-- SEC_MAX_CIKS_PER_RUN: default 50
+- SEC_MAX_CIKS_PER_RUN: default 250
 - SEC_START_CIK: default "" (if set, start from this CIK in the tickers list)
 
 S3 (optional; if not set, saves locally under /tmp/sec_raw):
@@ -73,7 +73,7 @@ def _settings() -> Settings:
 
     rps = float(os.environ.get("SEC_REQUESTS_PER_SECOND", "5"))
     timeout_s = int(os.environ.get("SEC_TIMEOUT_SECONDS", "30"))
-    max_ciks = int(os.environ.get("SEC_MAX_CIKS_PER_RUN", "50"))
+    max_ciks = int(os.environ.get("SEC_MAX_CIKS_PER_RUN", "250"))
     start_cik = os.environ.get("SEC_START_CIK", "").strip()
 
     s3_bucket = os.environ.get("SEC_S3_BUCKET", "").strip()
@@ -333,12 +333,18 @@ with DAG(
         # Stable order: by cik
         rows.sort(key=lambda r: int(r["cik"]))
 
+        logger.info("Found %d total companies in SEC tickers file", len(rows))
+
         # Optional: start from a particular CIK
         if cfg.start_cik:
             rows = [r for r in rows if int(r["cik"]) >= int(cfg.start_cik)]
+            logger.info("After start_cik filter (%s): %d companies", cfg.start_cik, len(rows))
 
         # Limit per run for sanity
-        return rows[: cfg.max_ciks]
+        logger.info("max_ciks limit: %d", cfg.max_ciks)
+        result = rows[: cfg.max_ciks]
+        logger.info("Returning %d companies (limited by max_ciks)", len(result))
+        return result
 
     def _process_single_company(
         cfg: Settings,
@@ -566,8 +572,20 @@ with DAG(
 
         return result
 
+    def _estimate_results_size_mb(results: List[Dict[str, str]]) -> float:
+        """Estimate the memory size of results list in MB."""
+        if not results:
+            return 0.0
+        # Rough estimate: serialize to JSON and measure bytes
+        try:
+            json_bytes = json.dumps(results, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            return len(json_bytes) / (1024.0 * 1024.0)
+        except Exception:
+            # Fallback: rough estimate based on count
+            return len(results) * 0.001  # ~1KB per result dict
+
     @task
-    def fetch_and_store_all_companies(companies: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    def fetch_and_store_all_companies(companies: List[Dict[str, str]]) -> Dict[str, Any]:
         """
         Process all companies sequentially in a single task.
         Downloads and stores JSON files for each company one at a time.
@@ -576,6 +594,7 @@ with DAG(
         - Processing one CIK at a time (no parallelism)
         - Logging memory usage for each step
         - Making it easier to identify which CIK causes memory problems
+        - Clearing results list after each company to test if it's causing memory growth
         """
         cfg = _settings()
         s = _session(cfg.user_agent)
@@ -593,6 +612,15 @@ with DAG(
         facts_downloaded_count = 0
         facts_skipped_count = 0
 
+        # Write results incrementally to a file to avoid losing them when we clear the list
+        results_file_path = None
+        if cfg.local_dir:
+            results_file_path = os.path.join(cfg.local_dir, "processing_results.jsonl")
+            # Clear any existing file
+            if os.path.exists(results_file_path):
+                os.remove(results_file_path)
+            logger.info("Writing results incrementally to: %s", results_file_path)
+
         for idx, company in enumerate(companies):
             mem_before = _get_memory_mb()
 
@@ -601,6 +629,11 @@ with DAG(
                     cfg, s, company, idx, total_companies, mem_before
                 )
                 results.append(result)
+
+                # Write result to file immediately
+                if results_file_path:
+                    with open(results_file_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(result, separators=(",", ":"), ensure_ascii=False) + "\n")
 
                 if result.get("facts_downloaded", False):
                     facts_downloaded_count += 1
@@ -617,6 +650,17 @@ with DAG(
                 # Continue with next company even if one fails
                 continue
 
+            # Monitor results list size before clearing
+            results_count = len(results)
+            results_size_mb = _estimate_results_size_mb(results)
+            results_size_kb = results_size_mb * 1024.0
+            logger.info(
+                "Results list: %d items, estimated size: %.3f MB (%.1f KB)",
+                results_count,
+                results_size_mb,
+                results_size_kb,
+            )
+
             mem_after = _get_memory_mb()
             logger.info(
                 "After CIK %s (%d/%d): Memory: %.1f MB (cumulative delta: +%.1f MB from start)",
@@ -627,15 +671,28 @@ with DAG(
                 mem_after - mem_initial,
             )
 
-            # Force garbage collection between companies to help identify leaks
+            # Clear results list to test if it's causing memory growth
+            mem_before_clear = _get_memory_mb()
+            results.clear()
             gc.collect()
-            mem_after_gc = _get_memory_mb()
-            if mem_after_gc < mem_after:
-                logger.info(
-                    "After GC: Memory: %.1f MB (freed %.1f MB)",
-                    mem_after_gc,
-                    mem_after - mem_after_gc,
-                )
+            mem_after_clear = _get_memory_mb()
+            freed_mb = mem_before_clear - mem_after_clear
+            logger.info(
+                "After clearing results list and GC: Memory: %.1f MB (freed %.3f MB from clearing)",
+                mem_after_clear,
+                freed_mb,
+            )
+
+        # Close the requests session to release connection pools
+        mem_before_session_close = _get_memory_mb()
+        s.close()
+        gc.collect()
+        mem_after_session_close = _get_memory_mb()
+        logger.info(
+            "After closing requests session and GC: Memory: %.1f MB (freed %.3f MB)",
+            mem_after_session_close,
+            mem_before_session_close - mem_after_session_close,
+        )
 
         mem_final = _get_memory_mb()
         logger.info("=" * 80)
@@ -646,32 +703,58 @@ with DAG(
         )
         logger.info(
             "Summary: %d companies processed, %d facts downloaded, %d facts skipped",
-            len(results),
+            total_companies,
             facts_downloaded_count,
             facts_skipped_count,
         )
         logger.info("=" * 80)
 
-        return results
+        # Return summary instead of full results to avoid recreating the list
+        # Results are already written to file if needed
+        return {
+            "results_file": results_file_path,
+            "total_companies": total_companies,
+            "facts_downloaded": facts_downloaded_count,
+            "facts_skipped": facts_skipped_count,
+        }
 
     @task
-    def summarize(results: List[Dict[str, str]]) -> None:
-        stored_s3 = sum(1 for r in results if r.get("stored") == "s3")
-        stored_local = sum(1 for r in results if r.get("stored") == "local")
-        facts_downloaded = sum(1 for r in results if r.get("facts_downloaded", True))
-        facts_skipped = len(results) - facts_downloaded
-        logger.info(
-            "Done. Stored to S3: %d, stored locally: %d",
-            stored_s3,
-            stored_local,
-        )
-        logger.info(
-            "Company facts downloaded: %d, skipped (no new filings): %d",
-            facts_downloaded,
-            facts_skipped,
-        )
-        if results:
-            logger.debug("Sample output: %s", json.dumps(results[0], indent=2))
+    def summarize(summary: Dict[str, Any]) -> None:
+        """Summarize the processing results."""
+        # Handle both old format (list) and new format (summary dict)
+        if isinstance(summary, dict) and "results_file" in summary:
+            # New format: summary dict
+            total_companies = summary.get("total_companies", 0)
+            facts_downloaded = summary.get("facts_downloaded", 0)
+            facts_skipped = summary.get("facts_skipped", 0)
+            results_file = summary.get("results_file")
+            logger.info(
+                "Done. Processed %d companies, %d facts downloaded, %d facts skipped",
+                total_companies,
+                facts_downloaded,
+                facts_skipped,
+            )
+            if results_file:
+                logger.info("Results written to: %s", results_file)
+        else:
+            # Old format: list of results (for backward compatibility)
+            results = summary if isinstance(summary, list) else []
+            stored_s3 = sum(1 for r in results if r.get("stored") == "s3")
+            stored_local = sum(1 for r in results if r.get("stored") == "local")
+            facts_downloaded = sum(1 for r in results if r.get("facts_downloaded", True))
+            facts_skipped = len(results) - facts_downloaded
+            logger.info(
+                "Done. Stored to S3: %d, stored locally: %d",
+                stored_s3,
+                stored_local,
+            )
+            logger.info(
+                "Company facts downloaded: %d, skipped (no new filings): %d",
+                facts_downloaded,
+                facts_skipped,
+            )
+            if results:
+                logger.debug("Sample output: %s", json.dumps(results[0], indent=2))
 
     companies = get_company_ciks()
     stored = fetch_and_store_all_companies(companies)
