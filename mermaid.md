@@ -1,4 +1,5 @@
-graph LR
+```mermaid
+    graph LR
     subgraph External_Sources [External Data]
         SEC[SEC EDGAR API/FTP]
     end
@@ -34,3 +35,4 @@ graph LR
     %% Styling
     style Airflow_Orchestration fill:#f9f,stroke:#333,stroke-width:2px
     style Data_Warehouse fill:#00a3e0,color:#fff,stroke:#333
+```
