@@ -23,6 +23,7 @@ Requires:
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import os
@@ -48,10 +49,8 @@ try:
 except Exception:  # pragma: no cover
     S3Hook = None  # type: ignore
 
-
 SEC_BASE = "https://data.sec.gov"
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
-
 
 @dataclass(frozen=True)
 class Settings:
@@ -63,7 +62,6 @@ class Settings:
     s3_bucket: str
     s3_prefix: str
     local_dir: str
-
 
 def _settings() -> Settings:
     user_agent = os.environ.get("SEC_USER_AGENT", "").strip()
@@ -94,7 +92,6 @@ def _settings() -> Settings:
         local_dir=local_dir,
     )
 
-
 def _session(user_agent: str) -> requests.Session:
     s = requests.Session()
     s.headers.update(
@@ -106,13 +103,11 @@ def _session(user_agent: str) -> requests.Session:
     )
     return s
 
-
 # --- Shared rate limiter for coordinated rate limiting across tasks ---
 # Uses a lock-protected global variable so all tasks in the same DAG run
 # coordinate to respect the overall rate limit (e.g., 5 req/s total, not per task)
 _rate_limit_lock = threading.Lock()
 _last_request_ts: float = 0.0
-
 
 def _rate_limit(rps: float) -> None:
     """
@@ -129,7 +124,7 @@ def _rate_limit(rps: float) -> None:
     a distributed lock mechanism.
     """
     global _last_request_ts
-    
+
     if rps <= 0:
         return
 
@@ -152,7 +147,6 @@ def _rate_limit(rps: float) -> None:
     with _rate_limit_lock:
         _last_request_ts = time.time()
 
-
 def _get_memory_mb() -> float:
     """Get current process memory usage in MB."""
     try:
@@ -160,7 +154,6 @@ def _get_memory_mb() -> float:
         return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
     except Exception:
         return 0.0
-
 
 def _get_json(
     s: requests.Session,
@@ -172,7 +165,7 @@ def _get_json(
 ) -> Dict[str, Any]:
     """
     Robust GET with backoff on 429/5xx.
-    
+
     Args:
         log_memory: If True, log memory usage before and after loading JSON
     """
@@ -218,21 +211,17 @@ def _get_json(
 
     raise AirflowFailException(f"Unreachable retry loop for {url}")
 
-
 def _pad_cik(cik: str) -> str:
     # SEC endpoints expect 10-digit, zero-padded CIK in some paths.
     return cik.zfill(10)
 
-
-def _s3_key(prefix: str, ingest_dt: str, cik: str, name: str) -> str:
-    return f"{prefix}/ingest_date={ingest_dt}/cik={cik}/{name}.json"
-
+def _s3_key(prefix: str, cik: str, name: str) -> str:
+    return f"{prefix}/cik={cik}/{name}.json"
 
 def _write_bytes(path: str, data: bytes) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as f:
         f.write(data)
-
 
 def _get_most_recent_filing_date(submissions_data: Dict[str, Any]) -> Optional[str]:
     """Extract the most recent filing date from submissions.json data."""
@@ -249,48 +238,60 @@ def _get_most_recent_filing_date(submissions_data: Dict[str, Any]) -> Optional[s
         return None
     return max(filing_dates)
 
+def _read_metadata(cik_dir: str) -> Optional[Dict[str, Any]]:
+    """Read metadata.json from a CIK directory."""
+    metadata_path = os.path.join(cik_dir, "metadata.json")
+    if not os.path.exists(metadata_path):
+        return None
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _write_metadata(cik_dir: str, latest_filing_date: Optional[str], ingest_date: str) -> None:
+    """Write metadata.json to a CIK directory."""
+    os.makedirs(cik_dir, exist_ok=True)
+    metadata = {
+        "latest_filing_date": latest_filing_date,
+        "last_updated": ingest_date,
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    }
+    metadata_path = os.path.join(cik_dir, "metadata.json")
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
 
 def _find_existing_data(cfg: Settings, cik: str) -> Optional[Dict[str, str]]:
     """
-    Find the most recent existing data for a CIK.
-    Returns dict with 'submissions' and 'companyfacts' paths, or None if not found.
+    Find existing data for a CIK in the new structure: data/sec_raw/cik={cik}/
+    Returns dict with 'submissions', 'companyfacts', and 'metadata' paths, or None if not found.
     """
     if cfg.s3_bucket:
         # For S3, we'd need to list objects - skipping for now, can add later
         return None
 
-    # For local storage, find the most recent ingest_date directory
+    # For local storage, check the new structure: cik={cik}/
     base_dir = cfg.local_dir
-    if not os.path.exists(base_dir):
+    cik_dir = os.path.join(base_dir, f"cik={cik}")
+
+    if not os.path.exists(cik_dir):
         return None
 
-    # Find all ingest_date directories
-    ingest_dirs = []
-    for item in os.listdir(base_dir):
-        if item.startswith("ingest_date="):
-            cik_dir = os.path.join(base_dir, item, f"cik={cik}")
-            sub_path = os.path.join(cik_dir, "submissions.json")
-            facts_path = os.path.join(cik_dir, "companyfacts.json")
-            if os.path.exists(sub_path) and os.path.exists(facts_path):
-                ingest_dirs.append((item, sub_path, facts_path))
+    sub_path = os.path.join(cik_dir, "submissions.json")
+    facts_path = os.path.join(cik_dir, "companyfacts.json")
+    metadata_path = os.path.join(cik_dir, "metadata.json")
 
-    if not ingest_dirs:
-        return None
+    # Return paths if they exist (submissions and metadata are required, companyfacts is optional)
+    if os.path.exists(sub_path) and os.path.exists(metadata_path):
+        result = {
+            "submissions": sub_path,
+            "metadata": metadata_path,
+        }
+        if os.path.exists(facts_path):
+            result["companyfacts"] = facts_path
+        return result
 
-    # Sort by ingest_date (descending) and return most recent
-    ingest_dirs.sort(key=lambda x: x[0], reverse=True)
-    _, sub_path, facts_path = ingest_dirs[0]
-    return {"submissions": sub_path, "companyfacts": facts_path}
-
-
-def _read_existing_submissions(path: str) -> Optional[Dict[str, Any]]:
-    """Read existing submissions.json file."""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
+    return None
 
 default_args = {
     "owner": "drclive",
@@ -339,43 +340,76 @@ with DAG(
         # Limit per run for sanity
         return rows[: cfg.max_ciks]
 
-    @task
-    def fetch_and_store_company_json(company: Dict[str, str]) -> Dict[str, str]:
+    def _process_single_company(
+        cfg: Settings,
+        s: requests.Session,
+        company: Dict[str, str],
+        company_index: int,
+        total_companies: int,
+        mem_before_company: float,
+    ) -> Dict[str, str]:
         """
-        For one company, download:
-          - /submissions/CIK##########.json
-          - /api/xbrl/companyfacts/CIK##########.json
-
-        Store raw JSON in S3 (if configured) else local dir.
-
-        Implements incremental updates: only downloads companyfacts.json (the large file)
-        if there are new filings since the last run.
-
+        Process a single company - downloads and stores JSON files.
         Returns metadata about where it stored the files.
         """
-        cfg = _settings()
-        s = _session(cfg.user_agent)
-
         cik = company["cik"]
+        ticker = company.get("ticker", "")
         cik10 = _pad_cik(cik)
         ingest_dt = datetime.utcnow().strftime("%Y-%m-%d")
+
+        logger.info(
+            "=" * 80
+        )
+        logger.info(
+            "Processing CIK %s (%s) - Company %d/%d",
+            cik,
+            ticker,
+            company_index + 1,
+            total_companies,
+        )
+        logger.info(
+            "Memory at start of CIK %s: %.1f MB",
+            cik,
+            mem_before_company,
+        )
 
         submissions_url = f"{SEC_BASE}/submissions/CIK{cik10}.json"
         facts_url = f"{SEC_BASE}/api/xbrl/companyfacts/CIK{cik10}.json"
 
-        # Check if we have existing data
+        # Check if we have existing data and read latest filing date from metadata
         existing_data = _find_existing_data(cfg, cik)
         existing_filing_date = None
-        if existing_data and existing_data.get("submissions"):
-            existing_submissions = _read_existing_submissions(existing_data["submissions"])
-            if existing_submissions:
-                existing_filing_date = _get_most_recent_filing_date(existing_submissions)
+        if existing_data and existing_data.get("metadata"):
+            metadata = _read_metadata(os.path.dirname(existing_data["metadata"]))
+            if metadata:
+                existing_filing_date = metadata.get("latest_filing_date")
+                logger.info(
+                    "CIK %s: Found existing data with latest filing date: %s",
+                    cik,
+                    existing_filing_date,
+                )
 
         # Always download submissions.json (it's relatively small and contains metadata)
-        mem_start = _get_memory_mb()
+        mem_before_submissions = _get_memory_mb()
+        logger.info(
+            "CIK %s: Downloading submissions.json. Memory: %.1f MB",
+            cik,
+            mem_before_submissions,
+        )
         submissions = _get_json(s, submissions_url, cfg.timeout_s, cfg.rps, log_memory=False)
         new_filing_date = _get_most_recent_filing_date(submissions)
         mem_after_submissions = _get_memory_mb()
+        logger.info(
+            "CIK %s: Downloaded submissions.json. Memory: %.1f MB (delta: +%.1f MB)",
+            cik,
+            mem_after_submissions,
+            mem_after_submissions - mem_before_submissions,
+        )
+        logger.info(
+            "CIK %s: Latest filing date in submissions: %s",
+            cik,
+            new_filing_date,
+        )
 
         # Only download companyfacts.json if there are new filings
         facts = None
@@ -394,25 +428,32 @@ with DAG(
 
         if needs_facts_download:
             # Log memory before downloading the large companyfacts.json file
+            mem_before_facts = _get_memory_mb()
             logger.info(
-                "CIK %s: Downloading companyfacts.json. Memory before: %.1f MB",
+                "CIK %s: Downloading companyfacts.json. Memory: %.1f MB",
                 cik,
-                _get_memory_mb(),
+                mem_before_facts,
             )
             facts = _get_json(s, facts_url, cfg.timeout_s, cfg.rps, log_memory=True)
             mem_after_facts = _get_memory_mb()
             logger.info(
-                "CIK %s: Loaded companyfacts.json. Memory: %.1f MB (delta: +%.1f MB from start)",
+                "CIK %s: Loaded companyfacts.json. Memory: %.1f MB (delta: +%.1f MB)",
                 cik,
                 mem_after_facts,
-                mem_after_facts - mem_start,
+                mem_after_facts - mem_before_facts,
             )
             facts_bytes = json.dumps(facts, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            logger.info(
+                "CIK %s: Encoded companyfacts to bytes. Size: %.1f MB",
+                cik,
+                len(facts_bytes) / 1024.0 / 1024.0,
+            )
             # Clear the facts dict from memory after encoding (help GC)
             del facts
+            gc.collect()
             mem_after_encode = _get_memory_mb()
             logger.info(
-                "CIK %s: Encoded to bytes. Memory: %.1f MB (freed %.1f MB)",
+                "CIK %s: After encoding and GC. Memory: %.1f MB (freed %.1f MB)",
                 cik,
                 mem_after_encode,
                 mem_after_facts - mem_after_encode,
@@ -426,12 +467,12 @@ with DAG(
         submissions_bytes = json.dumps(submissions, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         # Clear submissions dict after encoding
         del submissions
-        mem_final = _get_memory_mb()
+        gc.collect()
+        mem_after_cleanup = _get_memory_mb()
         logger.info(
-            "CIK %s: Task complete. Final memory: %.1f MB (total delta: +%.1f MB)",
+            "CIK %s: After cleanup. Memory: %.1f MB",
             cik,
-            mem_final,
-            mem_final - mem_start,
+            mem_after_cleanup,
         )
 
         if cfg.s3_bucket:
@@ -441,8 +482,9 @@ with DAG(
                     "Install apache-airflow-providers-amazon."
                 )
             hook = S3Hook(aws_conn_id="aws_default")
-            sub_key = _s3_key(cfg.s3_prefix, ingest_dt, cik, "submissions")
-            facts_key = _s3_key(cfg.s3_prefix, ingest_dt, cik, "companyfacts")
+            sub_key = _s3_key(cfg.s3_prefix, cik, "submissions")
+            facts_key = _s3_key(cfg.s3_prefix, cik, "companyfacts")
+            metadata_key = _s3_key(cfg.s3_prefix, cik, "metadata")
 
             hook.load_bytes(
                 bytes_data=submissions_bytes,
@@ -463,37 +505,154 @@ with DAG(
                 # Use existing facts location (from existing_data)
                 facts_location = existing_facts_path if existing_facts_path else f"s3://{cfg.s3_bucket}/{facts_key}"
 
-            return {
+            # Upload metadata.json
+            metadata = {
+                "latest_filing_date": new_filing_date,
+                "last_updated": ingest_dt,
+                "updated_at": datetime.utcnow().isoformat() + "Z",
+            }
+            metadata_bytes = json.dumps(metadata, indent=2).encode("utf-8")
+            hook.load_bytes(
+                bytes_data=metadata_bytes,
+                key=metadata_key,
+                bucket_name=cfg.s3_bucket,
+                replace=True,
+            )
+
+            result = {
                 "cik": cik,
-                "ticker": company.get("ticker", ""),
+                "ticker": ticker,
                 "stored": "s3",
                 "submissions": f"s3://{cfg.s3_bucket}/{sub_key}",
                 "companyfacts": facts_location,
                 "facts_downloaded": facts_bytes is not None,
             }
-
-        # Local fallback
-        base = os.path.join(cfg.local_dir, f"ingest_date={ingest_dt}", f"cik={cik}")
-        sub_path = os.path.join(base, "submissions.json")
-        facts_path = os.path.join(base, "companyfacts.json")
-        _write_bytes(sub_path, submissions_bytes)
-
-        # Only write companyfacts if we downloaded it
-        if facts_bytes is not None:
-            _write_bytes(facts_path, facts_bytes)
-            facts_location = facts_path
         else:
-            # Use existing facts location (don't copy, just reference)
-            facts_location = existing_facts_path if existing_facts_path else facts_path
+            # Local fallback - new structure: data/sec_raw/cik={cik}/
+            cik_dir = os.path.join(cfg.local_dir, f"cik={cik}")
+            sub_path = os.path.join(cik_dir, "submissions.json")
+            facts_path = os.path.join(cik_dir, "companyfacts.json")
 
-        return {
-            "cik": cik,
-            "ticker": company.get("ticker", ""),
-            "stored": "local",
-            "submissions": sub_path,
-            "companyfacts": facts_location,
-            "facts_downloaded": facts_bytes is not None,
-        }
+            _write_bytes(sub_path, submissions_bytes)
+
+            # Only write companyfacts if we downloaded it
+            if facts_bytes is not None:
+                _write_bytes(facts_path, facts_bytes)
+                facts_location = facts_path
+            else:
+                # Use existing facts location (don't copy, just reference)
+                facts_location = existing_facts_path if existing_facts_path else facts_path
+
+            # Write metadata.json with latest filing date
+            _write_metadata(cik_dir, new_filing_date, ingest_dt)
+
+            result = {
+                "cik": cik,
+                "ticker": ticker,
+                "stored": "local",
+                "submissions": sub_path,
+                "companyfacts": facts_location,
+                "facts_downloaded": facts_bytes is not None,
+            }
+
+        mem_final = _get_memory_mb()
+        logger.info(
+            "CIK %s: Complete. Final memory: %.1f MB (delta from start: +%.1f MB)",
+            cik,
+            mem_final,
+            mem_final - mem_before_company,
+        )
+        logger.info("=" * 80)
+
+        return result
+
+    @task
+    def fetch_and_store_all_companies(companies: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """
+        Process all companies sequentially in a single task.
+        Downloads and stores JSON files for each company one at a time.
+
+        This serial approach helps debug memory issues by:
+        - Processing one CIK at a time (no parallelism)
+        - Logging memory usage for each step
+        - Making it easier to identify which CIK causes memory problems
+        """
+        cfg = _settings()
+        s = _session(cfg.user_agent)
+
+        total_companies = len(companies)
+        logger.info(
+            "Starting serial processing of %d companies",
+            total_companies,
+        )
+
+        mem_initial = _get_memory_mb()
+        logger.info("Initial memory: %.1f MB", mem_initial)
+
+        results = []
+        facts_downloaded_count = 0
+        facts_skipped_count = 0
+
+        for idx, company in enumerate(companies):
+            mem_before = _get_memory_mb()
+
+            try:
+                result = _process_single_company(
+                    cfg, s, company, idx, total_companies, mem_before
+                )
+                results.append(result)
+
+                if result.get("facts_downloaded", False):
+                    facts_downloaded_count += 1
+                else:
+                    facts_skipped_count += 1
+
+            except Exception as e:
+                logger.error(
+                    "Failed to process CIK %s: %s",
+                    company.get("cik", "unknown"),
+                    str(e),
+                    exc_info=True,
+                )
+                # Continue with next company even if one fails
+                continue
+
+            mem_after = _get_memory_mb()
+            logger.info(
+                "After CIK %s (%d/%d): Memory: %.1f MB (cumulative delta: +%.1f MB from start)",
+                company.get("cik", "unknown"),
+                idx + 1,
+                total_companies,
+                mem_after,
+                mem_after - mem_initial,
+            )
+
+            # Force garbage collection between companies to help identify leaks
+            gc.collect()
+            mem_after_gc = _get_memory_mb()
+            if mem_after_gc < mem_after:
+                logger.info(
+                    "After GC: Memory: %.1f MB (freed %.1f MB)",
+                    mem_after_gc,
+                    mem_after - mem_after_gc,
+                )
+
+        mem_final = _get_memory_mb()
+        logger.info("=" * 80)
+        logger.info(
+            "All companies processed. Final memory: %.1f MB (total delta: +%.1f MB)",
+            mem_final,
+            mem_final - mem_initial,
+        )
+        logger.info(
+            "Summary: %d companies processed, %d facts downloaded, %d facts skipped",
+            len(results),
+            facts_downloaded_count,
+            facts_skipped_count,
+        )
+        logger.info("=" * 80)
+
+        return results
 
     @task
     def summarize(results: List[Dict[str, str]]) -> None:
@@ -515,6 +674,6 @@ with DAG(
             logger.debug("Sample output: %s", json.dumps(results[0], indent=2))
 
     companies = get_company_ciks()
-    stored = fetch_and_store_company_json.expand(company=companies)
+    stored = fetch_and_store_all_companies(companies)
 
     companies >> Label("download SEC JSON + store raw") >> stored >> summarize(stored)
