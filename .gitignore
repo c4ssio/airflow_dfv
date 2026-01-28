@@ -41,7 +41,6 @@ compose.override.yml
 # ----------------------
 .DS_Store
 .idea/
-.vscode/
 *.swp
 
 # ----------------------

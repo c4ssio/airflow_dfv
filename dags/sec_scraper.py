@@ -42,6 +42,15 @@ from airflow.decorators import task
 from airflow.exceptions import AirflowFailException
 from airflow.utils.edgemodifier import Label
 
+from plugins.scripts.sec_scraper.common import (
+    SecScraperConfigError,
+    Settings,
+    get_json as _get_json,
+    load_settings as _load_settings,
+    make_session as _session,
+)
+from plugins.scripts.sec_scraper.tasks.fetch_company_ciks import fetch_company_ciks
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -65,78 +74,12 @@ except Exception:  # pragma: no cover
 SEC_BASE = "https://data.sec.gov"
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 
-@dataclass(frozen=True)
-class Settings:
-    user_agent: str
-    rps: float
-    timeout_s: int
-    max_ciks: int
-    start_cik: str
-    s3_bucket: str
-    s3_prefix: str
-    local_dir: str
-    postgres_config_path: str
-    ingest_test_cik: str
-    ingest_max_ciks: int
-
 def _settings() -> Settings:
-    user_agent = os.environ.get("SEC_USER_AGENT", "").strip()
-    if not user_agent:
-        raise AirflowFailException(
-            "SEC_USER_AGENT is required. Set it to something like: "
-            "'drclive SEC scraper (you@drclive.net)'"
-        )
-
-    rps = float(os.environ.get("SEC_REQUESTS_PER_SECOND", "5"))
-    timeout_s = int(os.environ.get("SEC_TIMEOUT_SECONDS", "30"))
-    max_ciks = int(os.environ.get("SEC_MAX_CIKS_PER_RUN", "250"))
-    start_cik = os.environ.get("SEC_START_CIK", "").strip()
-
-    s3_bucket = os.environ.get("SEC_S3_BUCKET", "").strip()
-    s3_prefix = os.environ.get("SEC_S3_PREFIX", "sec_raw").strip().strip("/")
-
-    local_dir = os.environ.get("SEC_LOCAL_DIR", "/tmp/sec_raw").strip()
-
-    # Default path: /opt/airflow/config/postgres.yaml (when running in container)
-    # or ./config/postgres.yaml (when running locally)
-    default_config_path = "/opt/airflow/config/postgres.yaml"
-    if not os.path.exists(default_config_path):
-        # Fallback for local development
-        default_config_path = str(Path(__file__).parent.parent / "config" / "postgres.yaml")
-
-    postgres_config_path = os.environ.get(
-        "POSTGRES_CONFIG_PATH",
-        default_config_path,
-    ).strip()
-
-    # For ingestion testing: limit to a specific CIK or max number
-    ingest_test_cik = os.environ.get("SEC_INGEST_TEST_CIK", "").strip()
-    ingest_max_ciks = int(os.environ.get("SEC_INGEST_MAX_CIKS", "0"))  # 0 means no limit
-
-    return Settings(
-        user_agent=user_agent,
-        rps=rps,
-        timeout_s=timeout_s,
-        max_ciks=max_ciks,
-        start_cik=start_cik,
-        s3_bucket=s3_bucket,
-        s3_prefix=s3_prefix,
-        local_dir=local_dir,
-        postgres_config_path=postgres_config_path,
-        ingest_test_cik=ingest_test_cik,
-        ingest_max_ciks=ingest_max_ciks,
-    )
-
-def _session(user_agent: str) -> requests.Session:
-    s = requests.Session()
-    s.headers.update(
-        {
-            "User-Agent": user_agent,
-            "Accept-Encoding": "gzip, deflate",
-            "Accept": "application/json",
-        }
-    )
-    return s
+    """Load settings and raise an Airflow-friendly exception on config errors."""
+    try:
+        return _load_settings(__file__)
+    except SecScraperConfigError as e:
+        raise AirflowFailException(str(e))
 
 # --- Shared rate limiter for coordinated rate limiting across tasks ---
 # Uses a lock-protected global variable so all tasks in the same DAG run
@@ -783,33 +726,7 @@ with DAG(
         """
         cfg = _settings()
         s = _session(cfg.user_agent)
-        data = _get_json(s, TICKERS_URL, cfg.timeout_s, cfg.rps)
-
-        # company_tickers.json is a dict keyed by integers as strings.
-        # Each value has fields like cik_str, ticker, title.
-        rows: List[Dict[str, str]] = []
-        for _, v in data.items():
-            cik = str(v.get("cik_str", "")).strip()
-            ticker = str(v.get("ticker", "")).strip()
-            title = str(v.get("title", "")).strip()
-            if cik and ticker:
-                rows.append({"cik": cik, "ticker": ticker, "title": title})
-
-        # Stable order: by cik
-        rows.sort(key=lambda r: int(r["cik"]))
-
-        logger.info("Found %d total companies in SEC tickers file", len(rows))
-
-        # Optional: start from a particular CIK
-        if cfg.start_cik:
-            rows = [r for r in rows if int(r["cik"]) >= int(cfg.start_cik)]
-            logger.info("After start_cik filter (%s): %d companies", cfg.start_cik, len(rows))
-
-        # Limit per run for sanity
-        logger.info("max_ciks limit: %d", cfg.max_ciks)
-        result = rows[: cfg.max_ciks]
-        logger.info("Returning %d companies (limited by max_ciks)", len(result))
-        return result
+        return fetch_company_ciks(cfg, s, TICKERS_URL)
 
     def _process_single_company(
         cfg: Settings,
