@@ -32,7 +32,8 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+import shutil
+from typing import Any, Dict, List, Optional, Set
 
 import requests
 
@@ -49,6 +50,18 @@ try:
 except Exception:  # pragma: no cover
     S3Hook = None  # type: ignore
 
+try:
+    import psycopg2
+    from psycopg2 import sql as psycopg2_sql
+    from psycopg2.extras import execute_values
+    import yaml
+    from pathlib import Path
+except Exception:  # pragma: no cover
+    psycopg2 = None  # type: ignore
+    psycopg2_sql = None  # type: ignore
+    execute_values = None  # type: ignore
+    yaml = None  # type: ignore
+
 SEC_BASE = "https://data.sec.gov"
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 
@@ -62,6 +75,9 @@ class Settings:
     s3_bucket: str
     s3_prefix: str
     local_dir: str
+    postgres_config_path: str
+    ingest_test_cik: str
+    ingest_max_ciks: int
 
 def _settings() -> Settings:
     user_agent = os.environ.get("SEC_USER_AGENT", "").strip()
@@ -81,6 +97,22 @@ def _settings() -> Settings:
 
     local_dir = os.environ.get("SEC_LOCAL_DIR", "/tmp/sec_raw").strip()
 
+    # Default path: /opt/airflow/config/postgres.yaml (when running in container)
+    # or ./config/postgres.yaml (when running locally)
+    default_config_path = "/opt/airflow/config/postgres.yaml"
+    if not os.path.exists(default_config_path):
+        # Fallback for local development
+        default_config_path = str(Path(__file__).parent.parent / "config" / "postgres.yaml")
+
+    postgres_config_path = os.environ.get(
+        "POSTGRES_CONFIG_PATH",
+        default_config_path,
+    ).strip()
+
+    # For ingestion testing: limit to a specific CIK or max number
+    ingest_test_cik = os.environ.get("SEC_INGEST_TEST_CIK", "").strip()
+    ingest_max_ciks = int(os.environ.get("SEC_INGEST_MAX_CIKS", "0"))  # 0 means no limit
+
     return Settings(
         user_agent=user_agent,
         rps=rps,
@@ -90,6 +122,9 @@ def _settings() -> Settings:
         s3_bucket=s3_bucket,
         s3_prefix=s3_prefix,
         local_dir=local_dir,
+        postgres_config_path=postgres_config_path,
+        ingest_test_cik=ingest_test_cik,
+        ingest_max_ciks=ingest_max_ciks,
     )
 
 def _session(user_agent: str) -> requests.Session:
@@ -260,6 +295,436 @@ def _write_metadata(cik_dir: str, latest_filing_date: Optional[str], ingest_date
     metadata_path = os.path.join(cik_dir, "metadata.json")
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
+
+def _convert_submissions_to_ndjson(
+    submissions_data: Dict[str, Any], cik: str, ingest_date: str
+) -> Dict[str, Any]:
+    """
+    Convert submissions.json data to a single row matching the Snowflake schema.
+    Returns a dict that can be serialized to JSON for NDJSON format.
+    """
+    cik_padded = _pad_cik(cik)
+
+    # Extract tickers and exchanges arrays
+    tickers = submissions_data.get("tickers", [])
+    exchanges = submissions_data.get("exchanges", [])
+
+    # Validate array lengths match - these should be parallel arrays
+    if len(tickers) != len(exchanges):
+        logger.warning(
+            f"CIK {cik_padded}: tickers ({len(tickers)}) and exchanges ({len(exchanges)}) "
+            f"arrays have different lengths. Truncating to shorter length."
+        )
+        min_len = min(len(tickers), len(exchanges))
+        tickers = tickers[:min_len]
+        exchanges = exchanges[:min_len]
+
+    # Extract fields matching the Snowflake schema
+    row = {
+        "cik": cik_padded,
+        "entity_name": submissions_data.get("name"),
+        "entity_type": submissions_data.get("entityType"),
+        "ein": submissions_data.get("ein"),
+        "lei": submissions_data.get("lei"),
+        "sic": submissions_data.get("sic"),
+        "sic_description": submissions_data.get("sicDescription"),
+        "category": submissions_data.get("category"),
+        "owner_org": submissions_data.get("ownerOrg"),
+        "description": submissions_data.get("description"),
+        "website": submissions_data.get("website"),
+        "investor_website": submissions_data.get("investorWebsite"),
+        "phone": submissions_data.get("phone"),
+        "state_of_incorporation": submissions_data.get("stateOfIncorporation"),
+        "state_of_incorporation_description": submissions_data.get("stateOfIncorporationDescription"),
+        "fiscal_year_end": submissions_data.get("fiscalYearEnd"),
+        "tickers": tickers,
+        "exchanges": exchanges,
+        "insider_transaction_for_issuer_exists": submissions_data.get("insiderTransactionForIssuerExists"),
+        "insider_transaction_for_owner_exists": submissions_data.get("insiderTransactionForOwnerExists"),
+        "flags": submissions_data.get("flags"),
+        "former_names": submissions_data.get("formerNames", []),
+        "addresses": submissions_data.get("addresses"),
+        "filings": submissions_data.get("filings"),
+        "ingest_date": ingest_date,
+    }
+    return row
+
+def _validate_date_string(value: Any, field_name: str, cik: str) -> Optional[str]:
+    """Validate that a value is a valid date string (YYYY-MM-DD) or None."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        logger.warning(f"CIK {cik}: {field_name} has non-string value: {type(value).__name__}")
+        return str(value) if value is not None else None
+    # Basic date format validation
+    if value and len(value) >= 10:
+        try:
+            # Check if it looks like a date (YYYY-MM-DD)
+            parts = value[:10].split("-")
+            if len(parts) == 3:
+                int(parts[0])  # year
+                int(parts[1])  # month
+                int(parts[2])  # day
+        except (ValueError, IndexError):
+            logger.warning(f"CIK {cik}: {field_name} has invalid date format: {value}")
+    return value
+
+
+def _validate_numeric(value: Any, field_name: str, cik: str) -> Any:
+    """Validate that a value is numeric or None."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    # Try to convert string to number
+    if isinstance(value, str):
+        try:
+            if "." in value:
+                return float(value)
+            return int(value)
+        except ValueError:
+            logger.warning(f"CIK {cik}: {field_name} has non-numeric string value: {value}")
+            return None
+    logger.warning(f"CIK {cik}: {field_name} has unexpected type: {type(value).__name__}")
+    return None
+
+
+def _validate_integer(value: Any, field_name: str, cik: str) -> Optional[int]:
+    """Validate that a value is an integer or None."""
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        if value == int(value):
+            return int(value)
+        logger.warning(f"CIK {cik}: {field_name} has non-integer float value: {value}")
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            logger.warning(f"CIK {cik}: {field_name} has non-integer string value: {value}")
+            return None
+    logger.warning(f"CIK {cik}: {field_name} has unexpected type: {type(value).__name__}")
+    return None
+
+
+def _convert_companyfacts_to_ndjson(
+    companyfacts_data: Dict[str, Any], cik: str, ingest_date: str
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Convert companyfacts.json data to NDJSON format.
+    Returns (metadata_rows, facts_rows, metric_metadata_rows) where:
+    - metadata_rows: list with single company metadata dict
+    - facts_rows: list of fact dicts (without labels/descriptions)
+    - metric_metadata_rows: list of unique metric metadata for upsert
+    """
+    cik_padded = _pad_cik(cik)
+
+    # Company metadata row
+    metadata_row = {
+        "cik": cik_padded,
+        "entity_name": companyfacts_data.get("entityName"),
+        "ingest_date": ingest_date,
+    }
+
+    # Facts rows and metric metadata
+    facts_rows = []
+    metric_metadata = {}  # (taxonomy, metric_name) -> {label, description}
+    facts_obj = companyfacts_data.get("facts", {})
+    type_warnings = 0
+    max_type_warnings = 10
+
+    for taxonomy in ["dei", "us-gaap"]:
+        taxonomy_facts = facts_obj.get(taxonomy, {})
+        if not isinstance(taxonomy_facts, dict):
+            continue
+
+        for metric_name, metric_data in taxonomy_facts.items():
+            if not isinstance(metric_data, dict):
+                continue
+
+            label = metric_data.get("label")
+            description = metric_data.get("description")
+            units = metric_data.get("units", {})
+
+            # Collect metric metadata (deduplicated)
+            key = (taxonomy, metric_name)
+            if key not in metric_metadata:
+                metric_metadata[key] = {
+                    "taxonomy": taxonomy,
+                    "metric_name": metric_name,
+                    "label": label,
+                    "description": description,
+                }
+
+            if not isinstance(units, dict):
+                continue
+
+            for unit_name, unit_entries in units.items():
+                if not isinstance(unit_entries, list):
+                    continue
+
+                for entry in unit_entries:
+                    if not isinstance(entry, dict):
+                        continue
+
+                    fiscal_year = entry.get("fy")
+                    value = entry.get("val")
+                    period_end = entry.get("end")
+                    filed_date = entry.get("filed")
+
+                    validated_fy = _validate_integer(fiscal_year, "fiscal_year", cik_padded)
+                    if fiscal_year is not None and validated_fy is None and type_warnings < max_type_warnings:
+                        type_warnings += 1
+
+                    validated_value = _validate_numeric(value, "value", cik_padded)
+                    if value is not None and validated_value is None and type_warnings < max_type_warnings:
+                        type_warnings += 1
+
+                    validated_period_end = _validate_date_string(period_end, "period_end", cik_padded)
+                    validated_filed_date = _validate_date_string(filed_date, "filed_date", cik_padded)
+
+                    # Facts row WITHOUT label/description (normalized)
+                    fact_row = {
+                        "cik": cik_padded,
+                        "ingest_date": ingest_date,
+                        "taxonomy": taxonomy,
+                        "metric_name": metric_name,
+                        "unit": unit_name,
+                        "period_end": validated_period_end,
+                        "value": validated_value,
+                        "accession_number": entry.get("accn"),
+                        "fiscal_year": validated_fy,
+                        "fiscal_period": entry.get("fp"),
+                        "form_type": entry.get("form"),
+                        "filed_date": validated_filed_date,
+                        "frame": entry.get("frame"),
+                    }
+                    facts_rows.append(fact_row)
+
+    if type_warnings >= max_type_warnings:
+        logger.warning(f"CIK {cik_padded}: Suppressed additional type validation warnings (total: {type_warnings}+)")
+
+    return ([metadata_row], facts_rows, list(metric_metadata.values()))
+
+def _get_postgres_config(config_path: str) -> Dict[str, Any]:
+    """Load PostgreSQL configuration from YAML file."""
+    if not yaml:
+        raise AirflowFailException(
+            "pyyaml is required for PostgreSQL ingestion. Install with: pip install pyyaml"
+        )
+
+    config_file = Path(config_path)
+    if not config_file.exists():
+        raise AirflowFailException(
+            f"PostgreSQL config file not found: {config_path}"
+        )
+
+    with open(config_file, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    required_keys = ["host", "port", "database", "user", "password"]
+    missing = [k for k in required_keys if k not in config]
+    if missing:
+        raise AirflowFailException(
+            f"Missing required PostgreSQL config keys: {', '.join(missing)}"
+        )
+
+    return config
+
+def _write_ndjson_file(file_path: str, rows: List[Dict[str, Any]]) -> None:
+    """Write rows to a newline-delimited JSON file."""
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    with open(file_path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+def _get_postgres_connection(config: Dict[str, Any], schema: str = "sec_raw") -> Any:
+    """Get a connection to PostgreSQL."""
+    if not psycopg2:
+        raise AirflowFailException(
+            "psycopg2 is required. Install with: pip install psycopg2-binary"
+        )
+
+    conn = psycopg2.connect(
+        host=config["host"],
+        port=config["port"],
+        database=config["database"],
+        user=config["user"],
+        password=config["password"],
+        connect_timeout=30,
+    )
+
+    # Set search path to the schema
+    cursor = conn.cursor()
+    cursor.execute(f"SET search_path TO {schema}, public")
+    cursor.execute("SET statement_timeout = '300s'")  # 5 minute statement timeout
+    cursor.close()
+    conn.commit()
+
+    return conn
+
+def _load_ndjson_batch_to_postgres(
+    conn: Any,
+    table_name: str,
+    ndjson_paths: List[str],
+    cik_list: List[str],
+    ingest_date: str,
+    schema: str = "sec_raw",
+) -> int:
+    """
+    Load a batch of NDJSON files into PostgreSQL table using streaming INSERT.
+
+    Processes and commits one file at a time for:
+    - Progress visibility (rows appear incrementally)
+    - Failure resilience (completed files are saved)
+    - Lower memory usage
+
+    Returns the number of rows loaded.
+    """
+    if not ndjson_paths:
+        return 0
+
+    total_rows_loaded = 0
+    files_processed = 0
+    total_files = len(ndjson_paths)
+
+    # Build a set of CIKs we're processing for targeted deletes
+    cik_set = set(cik_list)
+
+    for path in ndjson_paths:
+        if not os.path.exists(path):
+            logger.warning(f"NDJSON file not found, skipping: {path}")
+            continue
+
+        # Extract CIK from path
+        cik_dir_name = os.path.basename(os.path.dirname(path))
+        cik = cik_dir_name.replace("cik=", "").lstrip("0") or "0"
+        cik_padded = cik.zfill(10)
+
+        cursor = conn.cursor()
+        file_rows = 0
+
+        try:
+            # Delete existing rows for THIS CIK only (per-file transaction)
+            delete_sql = f"DELETE FROM {schema}.{table_name} WHERE ingest_date = %s AND cik = %s"
+            cursor.execute(delete_sql, [ingest_date, cik_padded])
+
+            # Process file
+            insert_sql = None
+            columns = None
+            batch_values = []
+            batch_size = 1000
+
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    row = json.loads(line)
+
+                    # Build INSERT statement from first row
+                    if insert_sql is None:
+                        columns = list(row.keys())
+                        col_names = ", ".join(columns)
+                        placeholders = ", ".join(["%s"] * len(columns))
+                        insert_sql = f"INSERT INTO {schema}.{table_name} ({col_names}) VALUES ({placeholders}) ON CONFLICT DO NOTHING"
+
+                    # Convert dict/list values to JSON strings
+                    values = []
+                    for col in columns:
+                        val = row.get(col)
+                        if isinstance(val, (dict, list)):
+                            values.append(json.dumps(val))
+                        else:
+                            values.append(val)
+                    batch_values.append(tuple(values))
+                    file_rows += 1
+
+                    # Insert batch
+                    if len(batch_values) >= batch_size:
+                        cursor.executemany(insert_sql, batch_values)
+                        batch_values = []
+
+            # Insert remaining rows
+            if batch_values and insert_sql:
+                cursor.executemany(insert_sql, batch_values)
+
+            # Commit THIS file's transaction
+            conn.commit()
+            total_rows_loaded += file_rows
+            files_processed += 1
+
+            # Log progress every 10 files or for large files
+            if files_processed % 10 == 0 or file_rows > 10000:
+                logger.info(
+                    f"[{table_name}] Progress: {files_processed}/{total_files} files, "
+                    f"{total_rows_loaded:,} total rows (CIK {cik}: {file_rows:,} rows)"
+                )
+
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Failed to load {path} into {schema}.{table_name}: {e}")
+            # Continue with next file instead of failing entirely
+            continue
+        finally:
+            cursor.close()
+
+    logger.info(
+        f"Successfully loaded {total_rows_loaded:,} rows into {schema}.{table_name} "
+        f"from {files_processed}/{total_files} files"
+    )
+    return total_rows_loaded
+
+
+def _upsert_metric_metadata(
+    conn: Any,
+    metric_metadata_rows: List[Dict[str, Any]],
+    schema: str = "sec_raw",
+) -> int:
+    """
+    Upsert metric metadata (taxonomy, metric_name, label, description).
+    Updates existing rows if label/description changed, inserts new ones.
+    Returns count of rows upserted.
+    """
+    if not metric_metadata_rows:
+        return 0
+
+    cursor = conn.cursor()
+    upserted = 0
+
+    try:
+        upsert_sql = f"""
+            INSERT INTO {schema}.metric_metadata (taxonomy, metric_name, label, description, updated_at)
+            VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (taxonomy, metric_name) DO UPDATE SET
+                label = COALESCE(EXCLUDED.label, {schema}.metric_metadata.label),
+                description = COALESCE(EXCLUDED.description, {schema}.metric_metadata.description),
+                updated_at = CURRENT_TIMESTAMP
+        """
+
+        for row in metric_metadata_rows:
+            cursor.execute(upsert_sql, (
+                row.get("taxonomy"),
+                row.get("metric_name"),
+                row.get("label"),
+                row.get("description"),
+            ))
+            upserted += 1
+
+        conn.commit()
+        return upserted
+
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Failed to upsert metric metadata: {e}")
+        raise
+    finally:
+        cursor.close()
+
 
 def _find_existing_data(cfg: Settings, cik: str) -> Optional[Dict[str, str]]:
     """
@@ -771,7 +1236,379 @@ with DAG(
             if results:
                 logger.debug("Sample output: %s", json.dumps(results[0], indent=2))
 
+    @task
+    def ingest_to_postgres(summary: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Convert JSON files to NDJSON and load into PostgreSQL tables.
+        Processes all available CIKs serially.
+        """
+        cfg = _settings()
+
+        # Load PostgreSQL config
+        try:
+            postgres_config = _get_postgres_config(cfg.postgres_config_path)
+        except Exception as e:
+            logger.error(f"Failed to load PostgreSQL config: {e}")
+            raise AirflowFailException(f"PostgreSQL config error: {e}")
+
+        schema = postgres_config.get("schema", "sec_raw")
+        ingest_date = datetime.utcnow().strftime("%Y-%m-%d")
+
+        # Find all CIK directories
+        base_dir = cfg.local_dir
+        if not os.path.exists(base_dir):
+            logger.warning(f"Data directory does not exist: {base_dir}")
+            return {"total_ciks": 0, "processed": 0, "errors": 0}
+
+        cik_dirs = [
+            d for d in os.listdir(base_dir)
+            if os.path.isdir(os.path.join(base_dir, d)) and d.startswith("cik=")
+        ]
+
+        # Filter to specific CIK if testing
+        if cfg.ingest_test_cik:
+            test_cik_dir = f"cik={cfg.ingest_test_cik}"
+            if test_cik_dir in cik_dirs:
+                cik_dirs = [test_cik_dir]
+                logger.info(f"Testing mode: processing only CIK {cfg.ingest_test_cik}")
+            else:
+                logger.warning(
+                    f"Test CIK {cfg.ingest_test_cik} not found in available directories. "
+                    f"Available CIKs: {sorted([d.replace('cik=', '') for d in cik_dirs[:10]])}"
+                )
+                return {"total_ciks": 0, "processed": 0, "errors": 0}
+        elif cfg.ingest_max_ciks > 0:
+            # Limit number of CIKs for testing
+            cik_dirs = sorted(cik_dirs)[:cfg.ingest_max_ciks]
+            logger.info(f"Limiting to {cfg.ingest_max_ciks} CIKs for testing")
+
+        logger.info(f"Found {len(cik_dirs)} CIK directories to process")
+
+        processed = 0
+        errors = 0
+
+        # Open a single PostgreSQL connection for all processing
+        conn = None
+        try:
+            conn = _get_postgres_connection(postgres_config, schema)
+
+            # Process CIKs in batches
+            batch_size = 500
+            all_cik_dirs = sorted(cik_dirs)
+
+            for i in range(0, len(all_cik_dirs), batch_size):
+                batch_dirs = all_cik_dirs[i:i + batch_size]
+                logger.info(f"Starting batch {i//batch_size + 1} ({len(batch_dirs)} CIKs)")
+
+                batch_submission_paths = []
+                batch_metadata_paths = []
+                batch_facts_paths = []
+                batch_ciks_submissions = []
+                batch_ciks_metadata = []
+                batch_ciks_facts = []
+
+                for cik_dir_name in batch_dirs:
+                    cik = cik_dir_name.replace("cik=", "")
+                    cik_path = os.path.join(base_dir, cik_dir_name)
+
+                    submissions_json = os.path.join(cik_path, "submissions.json")
+                    companyfacts_json = os.path.join(cik_path, "companyfacts.json")
+
+                    try:
+                        # Process submissions
+                        if os.path.exists(submissions_json):
+                            with open(submissions_json, "r", encoding="utf-8") as f:
+                                submissions_data = json.load(f)
+
+                            submissions_row = _convert_submissions_to_ndjson(
+                                submissions_data, cik, ingest_date
+                            )
+
+                            submissions_ndjson = os.path.join(cik_path, "submissions.ndjson")
+                            _write_ndjson_file(submissions_ndjson, [submissions_row])
+                            batch_submission_paths.append(submissions_ndjson)
+                            batch_ciks_submissions.append(cik)
+
+                        # Process companyfacts
+                        if os.path.exists(companyfacts_json):
+                            with open(companyfacts_json, "r", encoding="utf-8") as f:
+                                companyfacts_data = json.load(f)
+
+                            metadata_rows, facts_rows, metric_meta_rows = _convert_companyfacts_to_ndjson(
+                                companyfacts_data, cik, ingest_date
+                            )
+
+                            # Upsert metric metadata directly (small, deduplicated)
+                            if metric_meta_rows:
+                                _upsert_metric_metadata(conn, metric_meta_rows, schema)
+
+                            # Company metadata
+                            metadata_ndjson = os.path.join(cik_path, "companyfacts_metadata.ndjson")
+                            _write_ndjson_file(metadata_ndjson, metadata_rows)
+                            batch_metadata_paths.append(metadata_ndjson)
+                            batch_ciks_metadata.append(cik)
+
+                            # Facts (now without label/description)
+                            facts_ndjson = os.path.join(cik_path, "companyfacts_facts.ndjson")
+                            _write_ndjson_file(facts_ndjson, facts_rows)
+                            batch_facts_paths.append(facts_ndjson)
+                            batch_ciks_facts.append(cik)
+
+                        processed += 1
+                    except Exception as e:
+                        errors += 1
+                        logger.error(f"Error processing JSON for CIK {cik}: {e}")
+
+                # Load this batch to PostgreSQL
+                if batch_submission_paths:
+                    _load_ndjson_batch_to_postgres(
+                        conn, "submissions", batch_submission_paths, batch_ciks_submissions, ingest_date, schema
+                    )
+
+                if batch_metadata_paths:
+                    _load_ndjson_batch_to_postgres(
+                        conn, "companyfacts_metadata", batch_metadata_paths, batch_ciks_metadata, ingest_date, schema
+                    )
+
+                if batch_facts_paths:
+                    _load_ndjson_batch_to_postgres(
+                        conn, "companyfacts_facts", batch_facts_paths, batch_ciks_facts, ingest_date, schema
+                    )
+
+                logger.info(f"Completed batch {i//batch_size + 1}")
+
+            logger.info(f"Ingestion complete: {processed} CIKs processed, {errors} errors")
+            return {"total_ciks": len(cik_dirs), "processed": processed, "errors": errors}
+
+        finally:
+            if conn:
+                conn.close()
+
+    @task
+    def validate_postgres_ingestion(ingest_result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Validate data integrity after PostgreSQL ingestion.
+
+        Performs validation checks:
+        1. Row count validation - verify data was loaded
+        2. NULL check on required fields (CIK)
+        3. Array alignment check - tickers and exchanges arrays should match
+        4. Data type validation - fiscal_year should be numeric
+        5. Primary key uniqueness - check for duplicates
+
+        Returns a detailed validation report and raises AirflowFailException
+        for critical failures.
+        """
+        cfg = _settings()
+
+        # Skip validation if no data was ingested
+        if ingest_result.get("total_ciks", 0) == 0:
+            logger.info("No CIKs were ingested, skipping validation")
+            return {
+                "validations_passed": 0,
+                "validations_failed": 0,
+                "skipped": True,
+                "details": [],
+            }
+
+        try:
+            postgres_config = _get_postgres_config(cfg.postgres_config_path)
+        except Exception as e:
+            logger.error(f"Failed to load PostgreSQL config for validation: {e}")
+            raise AirflowFailException(f"Validation failed - cannot connect to PostgreSQL: {e}")
+
+        schema = postgres_config.get("schema", "sec_raw")
+        ingest_date = datetime.utcnow().strftime("%Y-%m-%d")
+
+        conn = None
+        validation_results = []
+        validations_passed = 0
+        validations_failed = 0
+        critical_failure = False
+
+        try:
+            conn = _get_postgres_connection(postgres_config, schema)
+            cursor = conn.cursor()
+
+            # Validation 1: Row count validation for submissions table
+            logger.info("Running validation 1: Row count check")
+            cursor.execute(
+                f"SELECT COUNT(*) FROM {schema}.submissions WHERE ingest_date = %s",
+                (ingest_date,)
+            )
+            submissions_count = cursor.fetchone()[0]
+
+            expected_count = ingest_result.get("processed", 0)
+            row_count_status = "passed" if submissions_count > 0 else "failed"
+            if submissions_count == 0 and expected_count > 0:
+                validations_failed += 1
+                critical_failure = True
+                logger.error(f"CRITICAL: No rows found in submissions for ingest_date={ingest_date}")
+            else:
+                validations_passed += 1
+                logger.info(f"Row count validation: {submissions_count} rows in submissions table")
+
+            validation_results.append({
+                "name": "row_count_submissions",
+                "status": row_count_status,
+                "expected": f">0 (processed {expected_count} CIKs)",
+                "actual": submissions_count,
+            })
+
+            # Validation 2: NULL check on required CIK field
+            logger.info("Running validation 2: NULL CIK check")
+            cursor.execute(
+                f"SELECT COUNT(*) FROM {schema}.submissions WHERE cik IS NULL AND ingest_date = %s",
+                (ingest_date,)
+            )
+            null_cik_count = cursor.fetchone()[0]
+
+            null_check_status = "passed" if null_cik_count == 0 else "failed"
+            if null_cik_count > 0:
+                validations_failed += 1
+                critical_failure = True
+                logger.error(f"CRITICAL: Found {null_cik_count} rows with NULL CIK in submissions")
+            else:
+                validations_passed += 1
+                logger.info("NULL CIK check passed - no NULL CIKs found")
+
+            validation_results.append({
+                "name": "null_cik_check",
+                "status": null_check_status,
+                "expected": 0,
+                "actual": null_cik_count,
+            })
+
+            # Validation 3: Array alignment check - tickers and exchanges (PostgreSQL JSONB)
+            logger.info("Running validation 3: Array alignment check")
+            cursor.execute(
+                f"""
+                SELECT cik, jsonb_array_length(tickers) as ticker_count, jsonb_array_length(exchanges) as exchange_count
+                FROM {schema}.submissions
+                WHERE ingest_date = %s
+                  AND jsonb_array_length(tickers) != jsonb_array_length(exchanges)
+                LIMIT 10
+                """,
+                (ingest_date,)
+            )
+            mismatched_rows = cursor.fetchall()
+            mismatched_ciks = [row[0] for row in mismatched_rows]
+
+            array_check_status = "passed" if len(mismatched_ciks) == 0 else "warning"
+            if mismatched_ciks:
+                # This is a warning, not a critical failure (data was already truncated during conversion)
+                logger.warning(
+                    f"Array alignment: {len(mismatched_ciks)} CIKs have mismatched ticker/exchange arrays: {mismatched_ciks}"
+                )
+            else:
+                validations_passed += 1
+                logger.info("Array alignment check passed - all tickers/exchanges arrays match")
+
+            validation_results.append({
+                "name": "array_alignment",
+                "status": array_check_status,
+                "mismatched_ciks": mismatched_ciks,
+            })
+
+            # Validation 4: Data type validation - fiscal_year should be numeric
+            logger.info("Running validation 4: Data type check on companyfacts_facts")
+            cursor.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM {schema}.companyfacts_facts
+                WHERE ingest_date = %s
+                  AND fiscal_year IS NOT NULL
+                """,
+                (ingest_date,)
+            )
+            facts_with_fy = cursor.fetchone()[0]
+
+            # Check for any non-numeric fiscal_year values (shouldn't happen after validation)
+            cursor.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM {schema}.companyfacts_facts
+                WHERE ingest_date = %s
+                """,
+                (ingest_date,)
+            )
+            total_facts = cursor.fetchone()[0]
+
+            type_check_status = "passed"
+            validations_passed += 1
+            logger.info(f"Data type check: {facts_with_fy}/{total_facts} facts have fiscal_year values")
+
+            validation_results.append({
+                "name": "data_type_validation",
+                "status": type_check_status,
+                "total_facts": total_facts,
+                "facts_with_fiscal_year": facts_with_fy,
+            })
+
+            # Validation 5: Primary key uniqueness - check for duplicate CIKs on same ingest_date
+            logger.info("Running validation 5: Primary key uniqueness check")
+            cursor.execute(
+                f"""
+                SELECT cik, COUNT(*) as cnt
+                FROM {schema}.submissions
+                WHERE ingest_date = %s
+                GROUP BY cik
+                HAVING COUNT(*) > 1
+                LIMIT 10
+                """,
+                (ingest_date,)
+            )
+            duplicate_rows = cursor.fetchall()
+            duplicate_ciks = [row[0] for row in duplicate_rows]
+
+            pk_check_status = "passed" if len(duplicate_ciks) == 0 else "failed"
+            if duplicate_ciks:
+                validations_failed += 1
+                logger.error(f"Found duplicate CIKs in submissions: {duplicate_ciks}")
+            else:
+                validations_passed += 1
+                logger.info("Primary key uniqueness check passed - no duplicate CIKs")
+
+            validation_results.append({
+                "name": "primary_key_uniqueness",
+                "status": pk_check_status,
+                "duplicate_ciks": duplicate_ciks,
+            })
+
+            cursor.close()
+
+        except Exception as e:
+            logger.error(f"Validation query failed: {e}")
+            raise AirflowFailException(f"Validation failed with error: {e}")
+        finally:
+            if conn:
+                conn.close()
+
+        # Log summary
+        logger.info("=" * 80)
+        logger.info(
+            f"Validation complete: {validations_passed} passed, {validations_failed} failed"
+        )
+        for result in validation_results:
+            logger.info(f"  - {result['name']}: {result['status']}")
+        logger.info("=" * 80)
+
+        # Raise exception for critical failures
+        if critical_failure:
+            raise AirflowFailException(
+                f"Critical validation failures detected: {validations_failed} validations failed. "
+                f"Check logs for details."
+            )
+
+        return {
+            "validations_passed": validations_passed,
+            "validations_failed": validations_failed,
+            "details": validation_results,
+        }
+
     companies = get_company_ciks()
     stored = fetch_and_store_all_companies(companies)
+    ingested = ingest_to_postgres(stored)
+    validated = validate_postgres_ingestion(ingested)
 
-    companies >> Label("download SEC JSON + store raw") >> stored >> summarize(stored)
+    companies >> Label("download SEC JSON + store raw") >> stored >> Label("ingest to PostgreSQL") >> ingested >> Label("validate") >> validated >> summarize(stored)

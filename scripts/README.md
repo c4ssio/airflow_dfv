@@ -36,7 +36,7 @@ Runs Python commands using the project's virtual environment.
 **Examples:**
 ```bash
 # Run a Python script
-./scripts/run_with_venv.sh python plugins/scripts/sec_scraper/snowflake/deploy_migrations.py
+./scripts/run_with_venv.sh python plugins/scripts/sec_scraper/postgres/deploy_migrations.py
 
 # Run Python with arguments
 ./scripts/run_with_venv.sh python -m pytest tests/
