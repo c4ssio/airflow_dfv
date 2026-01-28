@@ -10,6 +10,12 @@ from scripts.sec_scraper.common import (
     convert_companyfacts_to_ndjson,
     convert_submissions_to_ndjson,
 )
+from scripts.sec_scraper.postgres.helpers import (
+    get_postgres_config,
+    get_postgres_connection,
+    load_ndjson_batch_to_postgres,
+    upsert_metric_metadata,
+)
 
 
 def _discover_cik_dirs(cfg: Settings) -> List[str]:
@@ -213,4 +219,44 @@ def ingest_ciks(
             conn.close()
 
     return {"total_ciks": len(cik_dirs), "processed": processed, "errors": errors}
+
+
+def ingest_to_postgres(cfg: Settings) -> Dict[str, Any]:
+    """
+    Ingest all CIKs to PostgreSQL.
+    
+    Loads PostgreSQL config, creates connection helpers, and delegates to ingest_ciks.
+    This is the main entry point for the DAG task.
+    """
+    # Load PostgreSQL config
+    try:
+        postgres_config = get_postgres_config(cfg.postgres_config_path)
+    except Exception as e:
+        raise RuntimeError(f"PostgreSQL config error: {e}")
+
+    # Create load functions wrapper
+    class _LoadFns:
+        @staticmethod
+        def get_connection(config: Dict[str, Any], schema: str):
+            return get_postgres_connection(config, schema)
+
+        @staticmethod
+        def load_ndjson_batch(
+            conn: Any,
+            table_name: str,
+            ndjson_paths: List[str],
+            cik_list: List[str],
+            ingest_date: str,
+            schema: str,
+        ) -> int:
+            return load_ndjson_batch_to_postgres(
+                conn, table_name, ndjson_paths, cik_list, ingest_date, schema
+            )
+
+    return ingest_ciks(
+        cfg=cfg,
+        postgres_config=postgres_config,
+        load_fn=_LoadFns,
+        upsert_metric_metadata_fn=upsert_metric_metadata,
+    )
 
