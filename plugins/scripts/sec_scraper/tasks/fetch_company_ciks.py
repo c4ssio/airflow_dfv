@@ -5,7 +5,7 @@ from typing import Any, Dict, List
 
 import requests
 
-from plugins.scripts.sec_scraper.common import Settings, get_json
+from scripts.sec_scraper.common import Settings, get_json
 
 logger = logging.getLogger(__name__)
 

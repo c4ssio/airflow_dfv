@@ -7,7 +7,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -169,4 +169,217 @@ def get_json(
         raise RuntimeError(f"SEC request failed: url={url} status={resp.status_code} body={resp.text[:500]}")
 
     raise RuntimeError(f"SEC request failed after {max_attempts} attempts: {url}")
+
+
+# -------------------------
+# Data normalization helpers
+# -------------------------
+
+def pad_cik(cik: str) -> str:
+    """Zero-pad a CIK to 10 digits (SEC convention)."""
+    return cik.zfill(10)
+
+
+def validate_date_string(value: Any, field_name: str, cik: str) -> Optional[str]:
+    """Validate that a value is a valid date string (YYYY-MM-DD-ish) or None."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        logger.warning("CIK %s: %s has non-string value: %s", cik, field_name, type(value).__name__)
+        return str(value)
+    if value and len(value) >= 10:
+        try:
+            parts = value[:10].split("-")
+            if len(parts) == 3:
+                int(parts[0])
+                int(parts[1])
+                int(parts[2])
+        except (ValueError, IndexError):
+            logger.warning("CIK %s: %s has invalid date format: %s", cik, field_name, value)
+    return value
+
+
+def validate_numeric(value: Any, field_name: str, cik: str) -> Any:
+    """Validate that a value is numeric or None."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        try:
+            if "." in value:
+                return float(value)
+            return int(value)
+        except ValueError:
+            logger.warning("CIK %s: %s has non-numeric string value: %s", cik, field_name, value)
+            return None
+    logger.warning("CIK %s: %s has unexpected type: %s", cik, field_name, type(value).__name__)
+    return None
+
+
+def validate_integer(value: Any, field_name: str, cik: str) -> Optional[int]:
+    """Validate that a value is an integer or None."""
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        if value == int(value):
+            return int(value)
+        logger.warning("CIK %s: %s has non-integer float value: %s", cik, field_name, value)
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            logger.warning("CIK %s: %s has non-integer string value: %s", cik, field_name, value)
+            return None
+    logger.warning("CIK %s: %s has unexpected type: %s", cik, field_name, type(value).__name__)
+    return None
+
+
+def convert_submissions_to_ndjson(
+    submissions_data: Dict[str, Any], cik: str, ingest_date: str
+) -> Dict[str, Any]:
+    """Convert submissions.json data to a single NDJSON-ready row."""
+    cik_padded = pad_cik(cik)
+
+    tickers = submissions_data.get("tickers", [])
+    exchanges = submissions_data.get("exchanges", [])
+
+    if len(tickers) != len(exchanges):
+        logger.warning(
+            "CIK %s: tickers (%d) and exchanges (%d) lengths differ. Truncating.",
+            cik_padded,
+            len(tickers),
+            len(exchanges),
+        )
+        min_len = min(len(tickers), len(exchanges))
+        tickers = tickers[:min_len]
+        exchanges = exchanges[:min_len]
+
+    row = {
+        "cik": cik_padded,
+        "entity_name": submissions_data.get("name"),
+        "entity_type": submissions_data.get("entityType"),
+        "ein": submissions_data.get("ein"),
+        "lei": submissions_data.get("lei"),
+        "sic": submissions_data.get("sic"),
+        "sic_description": submissions_data.get("sicDescription"),
+        "category": submissions_data.get("category"),
+        "owner_org": submissions_data.get("ownerOrg"),
+        "description": submissions_data.get("description"),
+        "website": submissions_data.get("website"),
+        "investor_website": submissions_data.get("investorWebsite"),
+        "phone": submissions_data.get("phone"),
+        "state_of_incorporation": submissions_data.get("stateOfIncorporation"),
+        "state_of_incorporation_description": submissions_data.get("stateOfIncorporationDescription"),
+        "fiscal_year_end": submissions_data.get("fiscalYearEnd"),
+        "tickers": tickers,
+        "exchanges": exchanges,
+        "insider_transaction_for_issuer_exists": submissions_data.get("insiderTransactionForIssuerExists"),
+        "insider_transaction_for_owner_exists": submissions_data.get("insiderTransactionForOwnerExists"),
+        "flags": submissions_data.get("flags"),
+        "former_names": submissions_data.get("formerNames", []),
+        "addresses": submissions_data.get("addresses"),
+        "filings": submissions_data.get("filings"),
+        "ingest_date": ingest_date,
+    }
+    return row
+
+
+def convert_companyfacts_to_ndjson(
+    companyfacts_data: Dict[str, Any], cik: str, ingest_date: str
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Convert companyfacts.json to (metadata_rows, facts_rows, metric_metadata_rows)."""
+    cik_padded = pad_cik(cik)
+
+    metadata_row = {
+        "cik": cik_padded,
+        "entity_name": companyfacts_data.get("entityName"),
+        "ingest_date": ingest_date,
+    }
+
+    facts_rows: List[Dict[str, Any]] = []
+    metric_metadata: Dict[tuple[str, str], Dict[str, Any]] = {}
+    facts_obj = companyfacts_data.get("facts", {})
+    type_warnings = 0
+    max_type_warnings = 10
+
+    for taxonomy in ["dei", "us-gaap"]:
+        taxonomy_facts = facts_obj.get(taxonomy, {})
+        if not isinstance(taxonomy_facts, dict):
+            continue
+
+        for metric_name, metric_data in taxonomy_facts.items():
+            if not isinstance(metric_data, Dict):
+                continue
+
+            label = metric_data.get("label")
+            description = metric_data.get("description")
+            units = metric_data.get("units", {})
+
+            key = (taxonomy, metric_name)
+            if key not in metric_metadata:
+                metric_metadata[key] = {
+                    "taxonomy": taxonomy,
+                    "metric_name": metric_name,
+                    "label": label,
+                    "description": description,
+                }
+
+            if not isinstance(units, dict):
+                continue
+
+            for unit_name, unit_entries in units.items():
+                if not isinstance(unit_entries, list):
+                    continue
+
+                for entry in unit_entries:
+                    if not isinstance(entry, dict):
+                        continue
+
+                    fiscal_year = entry.get("fy")
+                    value = entry.get("val")
+                    period_end = entry.get("end")
+                    filed_date = entry.get("filed")
+
+                    validated_fy = validate_integer(fiscal_year, "fiscal_year", cik_padded)
+                    if fiscal_year is not None and validated_fy is None and type_warnings < max_type_warnings:
+                        type_warnings += 1
+
+                    validated_value = validate_numeric(value, "value", cik_padded)
+                    if value is not None and validated_value is None and type_warnings < max_type_warnings:
+                        type_warnings += 1
+
+                    validated_period_end = validate_date_string(period_end, "period_end", cik_padded)
+                    validated_filed_date = validate_date_string(filed_date, "filed_date", cik_padded)
+
+                    fact_row = {
+                        "cik": cik_padded,
+                        "ingest_date": ingest_date,
+                        "taxonomy": taxonomy,
+                        "metric_name": metric_name,
+                        "unit": unit_name,
+                        "period_end": validated_period_end,
+                        "value": validated_value,
+                        "accession_number": entry.get("accn"),
+                        "fiscal_year": validated_fy,
+                        "fiscal_period": entry.get("fp"),
+                        "form_type": entry.get("form"),
+                        "filed_date": validated_filed_date,
+                        "frame": entry.get("frame"),
+                    }
+                    facts_rows.append(fact_row)
+
+    if type_warnings >= max_type_warnings:
+        logger.warning(
+            "CIK %s: Suppressed additional type validation warnings (total: %d+)",
+            cik_padded,
+            type_warnings,
+        )
+
+    metric_metadata_rows = list(metric_metadata.values())
+    return [metadata_row], facts_rows, metric_metadata_rows
+
 

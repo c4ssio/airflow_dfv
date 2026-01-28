@@ -9,8 +9,7 @@ airflow.cfg
 data/
 tmp/
 *.parquet
-*.csv
-*.json
+
 
 # ----------------------
 # Python artifacts
@@ -62,6 +61,9 @@ build/
 
 # Local diagnostics produced by helper scripts
 diagnostics/
+
+# Editor configuration we *do* want in git
+!.vscode/settings.json
 
 # Local config with generated secrets
 config/

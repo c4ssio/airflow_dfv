@@ -6,8 +6,8 @@ import types
 
 import requests
 
-from plugins.scripts.sec_scraper.common import Settings
-from plugins.scripts.sec_scraper.tasks.fetch_company_ciks import fetch_company_ciks
+from scripts.sec_scraper.common import Settings
+from scripts.sec_scraper.tasks.fetch_company_ciks import fetch_company_ciks
 
 
 class DummySession(requests.Session):
