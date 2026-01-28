@@ -4,8 +4,6 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List
 
-from airflow.exceptions import AirflowFailException
-
 from scripts.sec_scraper.common import Settings
 from scripts.sec_scraper.postgres.helpers import get_postgres_config, get_postgres_connection
 

@@ -92,7 +92,7 @@ def _build_ndjson_for_cik(
         with open(companyfacts_json, "r", encoding="utf-8") as f:
             companyfacts_data = json.load(f)
 
-        metadata_rows, facts_rows, metric_meta_rows = convert_companyfacts_to_ndjson(
+        metadata_rows, facts_rows, _ = convert_companyfacts_to_ndjson(
             companyfacts_data, cik, ingest_date
         )
 
@@ -149,10 +149,9 @@ def ingest_ciks(
         conn = load_fn.get_connection(postgres_config, schema)
 
         batch_size = 500
-        all_cik_dirs = sorted(cik_dirs)
 
-        for i in range(0, len(all_cik_dirs), batch_size):
-            batch_dirs = all_cik_dirs[i : i + batch_size]
+        for i in range(0, len(cik_dirs), batch_size):
+            batch_dirs = sorted(cik_dirs)[i : i + batch_size]
 
             batch_submission_paths: List[str] = []
             batch_metadata_paths: List[str] = []

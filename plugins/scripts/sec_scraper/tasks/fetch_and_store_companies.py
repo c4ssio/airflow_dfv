@@ -26,12 +26,8 @@ def process_single_company(
     cfg: Settings,
     session: requests.Session,
     company: Dict[str, str],
-    company_index: int,
-    total_companies: int,
-    mem_before_company: float,
     *,
     sec_base: str,
-    tickers_url_base: str | None = None,
     find_existing_data_fn=None,
     read_metadata_fn=None,
     write_bytes_fn=None,
@@ -58,11 +54,9 @@ def process_single_company(
         if metadata:
             existing_filing_date = metadata.get("latest_filing_date")
 
-    mem_before_submissions = get_memory_mb()
     submissions = get_json(session, submissions_url, cfg.timeout_s, cfg.rps, log_memory=False)
-    from scripts.sec_scraper.common import validate_date_string  # local import to avoid cycles
 
-    # _get_most_recent_filing_date logic, made local for easier testing
+    # Extract most recent filing date
     def _most_recent_filing_date(sub_data: Dict[str, Any]) -> str | None:
         filings = sub_data.get("filings") or {}
         recent = filings.get("recent") or {}
@@ -72,7 +66,6 @@ def process_single_company(
         return max(filing_dates)
 
     new_filing_date = _most_recent_filing_date(submissions)
-    mem_after_submissions = get_memory_mb()
 
     # Only download companyfacts.json if there are new filings
     facts = None
@@ -84,10 +77,8 @@ def process_single_company(
             needs_facts_download = False
 
     if needs_facts_download:
-        mem_before_facts = get_memory_mb()
         try:
             facts = get_json(session, facts_url, cfg.timeout_s, cfg.rps, log_memory=True)
-            mem_after_facts = get_memory_mb()
             facts_bytes = json.dumps(facts, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
             del facts
             gc.collect()
@@ -133,8 +124,6 @@ def process_single_company(
             "companyfacts": facts_location,
             "facts_downloaded": facts_bytes is not None,
         }
-
-    mem_final = get_memory_mb()
 
     return result
 
@@ -188,9 +177,6 @@ def fetch_and_store_companies(
                 cfg,
                 session,
                 company,
-                idx,
-                total_companies,
-                mem_before,
                 sec_base=sec_base,
                 find_existing_data_fn=find_existing_data,
                 read_metadata_fn=read_metadata,
