@@ -35,6 +35,7 @@ x-airflow-common: &airflow-common
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
     - ./data:/opt/airflow/data
+    - ./config:/opt/airflow/config
     - ./config/simple_auth_manager_passwords.json.generated:/opt/airflow/simple_auth_manager_passwords.json.generated
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
@@ -52,6 +53,9 @@ services:
       POSTGRES_DB: airflow
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
+      - ./scripts/init-sec-db.sql:/docker-entrypoint-initdb.d/init-sec-db.sql
+    ports:
+      - "5432:5432"
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "airflow"]
       interval: 5s
