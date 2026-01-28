@@ -118,7 +118,7 @@ def _write_ndjson_file(file_path: str, rows: List[Dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def ingest_all_ciks(
+def ingest_ciks(
     cfg: Settings,
     postgres_config: Dict[str, Any],
     load_fn,

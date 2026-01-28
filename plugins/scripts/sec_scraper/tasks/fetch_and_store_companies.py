@@ -150,14 +150,14 @@ def estimate_results_size_mb(results: List[Dict[str, str]]) -> float:
         return len(results) * 0.001
 
 
-def fetch_and_store_all_companies(
+def fetch_and_store_companies(
     cfg: Settings,
     session: requests.Session,
     companies: List[Dict[str, str]],
     sec_base: str,
 ) -> Dict[str, Any]:
     """
-    Process all companies sequentially.
+    Process companies sequentially.
     
     Downloads and stores JSON files for each company one at a time.
     Includes memory monitoring, incremental file writing, and error handling.
@@ -283,4 +283,3 @@ def fetch_and_store_all_companies(
         "facts_downloaded": facts_downloaded_count,
         "facts_skipped": facts_skipped_count,
     }
-

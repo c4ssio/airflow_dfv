@@ -44,6 +44,11 @@ To run migrations manually:
 docker compose exec airflow-worker python /opt/airflow/plugins/scripts/sec_scraper/postgres/deploy_migrations.py
 ```
 
+## Code Style Guidelines
+- **Avoid meaningless qualifiers**: Don't use "all" in function/method names (e.g., use `fetch_companies` not `fetch_all_companies`, `ingest_ciks` not `ingest_all_ciks`).
+- **Keep DAG files thin**: Extract business logic to `plugins/scripts/sec_scraper/` modules. DAG files should contain only task wrappers and orchestration.
+- **Testability**: Functions should accept dependencies as parameters (dependency injection) rather than importing them directly, making them easier to unit test.
+
 ## Notes for Changes
 - Do not commit secrets from `config/secrets.env` or `config/postgres.yaml`.
 - Raw data in `data/` and logs in `logs/` are local-only.

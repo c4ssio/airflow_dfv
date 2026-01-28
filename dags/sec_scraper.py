@@ -130,12 +130,12 @@ with DAG(
         return fetch_company_ciks(cfg, s, TICKERS_URL)
 
     @task
-    def fetch_and_store_all_companies(companies: List[Dict[str, str]]) -> Dict[str, Any]:
-        """Process all companies sequentially and store JSON files."""
+    def fetch_and_store_companies(companies: List[Dict[str, str]]) -> Dict[str, Any]:
+        """Process companies sequentially and store JSON files."""
         cfg = _settings()
         s = _session(cfg.user_agent)
-        from scripts.sec_scraper.tasks.fetch_and_store_all_companies import (
-            fetch_and_store_all_companies as _fetch_and_store,
+        from scripts.sec_scraper.tasks.fetch_and_store_companies import (
+            fetch_and_store_companies as _fetch_and_store,
         )
         return _fetch_and_store(cfg, s, companies, SEC_BASE)
 
@@ -193,7 +193,7 @@ with DAG(
             raise AirflowFailException(f"PostgreSQL config error: {e}")
 
         # Delegate to shared ingestion implementation for testability
-        from scripts.sec_scraper.tasks.ingest_to_postgres import ingest_all_ciks
+        from scripts.sec_scraper.tasks.ingest_to_postgres import ingest_ciks
 
         class _LoadFns:
             @staticmethod
@@ -213,7 +213,7 @@ with DAG(
                     conn, table_name, ndjson_paths, cik_list, ingest_date, schema
                 )
 
-        result = ingest_all_ciks(
+        result = ingest_ciks(
             cfg=cfg,
             postgres_config=postgres_config,
             load_fn=_LoadFns,
@@ -239,7 +239,7 @@ with DAG(
             raise AirflowFailException(str(e))
 
     companies = get_company_ciks()
-    stored = fetch_and_store_all_companies(companies)
+    stored = fetch_and_store_companies(companies)
     ingested = ingest_to_postgres(stored)
     validated = validate_postgres_ingestion(ingested)
 
