@@ -4,7 +4,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 from airflow.exceptions import AirflowFailException
 
@@ -69,6 +69,19 @@ def get_postgres_connection(config: Dict[str, Any], schema: str = "sec_raw") -> 
     conn.commit()
 
     return conn
+
+
+def get_ciks_already_ingested(conn: Any, schema: str, ingest_date: str) -> Set[str]:
+    """Return set of zero-padded CIKs that already have a row in submissions for this ingest_date."""
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            f"SELECT cik FROM {schema}.submissions WHERE ingest_date = %s",
+            (ingest_date,),
+        )
+        return {row[0] for row in cursor.fetchall() if row and row[0]}
+    finally:
+        cursor.close()
 
 
 def load_ndjson_batch_to_postgres(

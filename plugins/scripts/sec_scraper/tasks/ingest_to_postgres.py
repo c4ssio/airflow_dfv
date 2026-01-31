@@ -11,6 +11,7 @@ from scripts.sec_scraper.common import (
     convert_submissions_to_ndjson,
 )
 from scripts.sec_scraper.postgres.helpers import (
+    get_ciks_already_ingested,
     get_postgres_config,
     get_postgres_connection,
     load_ndjson_batch_to_postgres,
@@ -124,6 +125,12 @@ def _write_ndjson_file(file_path: str, rows: List[Dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def _cik_from_dir_name(cik_dir_name: str) -> str:
+    """Zero-padded 10-digit CIK for comparison with DB."""
+    cik = cik_dir_name.replace("cik=", "").lstrip("0") or "0"
+    return cik.zfill(10)
+
+
 def ingest_ciks(
     cfg: Settings,
     postgres_config: Dict[str, Any],
@@ -135,7 +142,7 @@ def ingest_ciks(
     cik_dirs = _discover_cik_dirs(cfg)
 
     if not cik_dirs:
-        return {"total_ciks": 0, "processed": 0, "errors": 0}
+        return {"total_ciks": 0, "processed": 0, "errors": 0, "skipped": 0}
 
     ingest_date = datetime.utcnow().strftime("%Y-%m-%d")
     schema = postgres_config.get("schema", "sec_raw")
@@ -148,10 +155,18 @@ def ingest_ciks(
     try:
         conn = load_fn.get_connection(postgres_config, schema)
 
+        # Skip CIKs already imported for this ingest_date (idempotent runs)
+        already_ingested = get_ciks_already_ingested(conn, schema, ingest_date)
+        cik_dirs_to_process = [
+            d for d in cik_dirs
+            if _cik_from_dir_name(d) not in already_ingested
+        ]
+        skipped = len(cik_dirs) - len(cik_dirs_to_process)
+
         batch_size = 500
 
-        for i in range(0, len(cik_dirs), batch_size):
-            batch_dirs = sorted(cik_dirs)[i : i + batch_size]
+        for i in range(0, len(cik_dirs_to_process), batch_size):
+            batch_dirs = sorted(cik_dirs_to_process)[i : i + batch_size]
 
             batch_submission_paths: List[str] = []
             batch_metadata_paths: List[str] = []
@@ -217,7 +232,12 @@ def ingest_ciks(
         if conn:
             conn.close()
 
-    return {"total_ciks": len(cik_dirs), "processed": processed, "errors": errors}
+    return {
+        "total_ciks": len(cik_dirs),
+        "processed": processed,
+        "errors": errors,
+        "skipped": skipped,
+    }
 
 
 def ingest_to_postgres(cfg: Settings) -> Dict[str, Any]:

@@ -1,8 +1,15 @@
 # Scripts
 
-Helper scripts for managing the Airflow DFV project.
+Helper scripts for managing the Airflow DFV project. Run from the **repo root** unless noted.
 
-## Available Scripts
+## Ad-hoc / manual scripts
+
+Scripts meant to be run manually (diagnostics, one-off checks) live in **`scripts/adhoc/`**. See **`scripts/adhoc/README.md`** for:
+
+- **check_ticker_price_coverage.sql** – Count tracked tickers vs tickers with prices in `ticker_prices_daily`.
+- **check_yahoo_missing.py** – Classify why some tracked tickers have no price (Yahoo Finance response).
+
+## Operational scripts
 
 ### `setup_venv.sh`
 Creates and configures the Python virtual environment for the project.
@@ -213,12 +220,14 @@ Monitors memory usage over time to identify memory leaks and growth patterns.
 
 | Script | Purpose | When to Use |
 |--------|---------|-------------|
+| **adhoc/** | Manual diagnostics (price coverage, Yahoo missing tickers) | See `scripts/adhoc/README.md` |
 | `setup_venv.sh` | Create/update virtual environment | Initial setup, after dependency changes |
 | `run_with_venv.sh` | Run commands with venv | Running Python scripts, migrations |
 | `check_airflow.sh` | Collect diagnostics | Troubleshooting, debugging |
 | `restart_airflow_services.sh` | Restart Airflow services | After config changes, stuck tasks |
 | `check_worker_memory.sh` | Snapshot of worker memory usage | Quick memory check, current state |
 | `monitor_worker_memory.sh` | Track memory over time | Memory leak detection, growth analysis |
+| `cleanup_removed_tasks.py` | Remove task metadata no longer in DAG | After DAG/task renames or removals |
 
 ## Prerequisites
 

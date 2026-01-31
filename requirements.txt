@@ -3,3 +3,4 @@ apache-airflow-providers-amazon==9.8.0
 psycopg2-binary>=2.9.0
 pyyaml>=6.0.0
 pytest>=8.0.0
+yfinance>=0.2.0

@@ -1,53 +1,43 @@
-## SEC Scraper DAG Intent
-This DAG downloads SEC EDGAR company submissions and company facts, stores raw
-JSON by CIK, and ingests normalized data into PostgreSQL.
+# SEC Scraper DAG
+
+This DAG downloads SEC EDGAR company submissions and company facts, stores raw JSON by CIK, ingests normalized data into PostgreSQL, validates the load, fetches daily ticker prices (Yahoo Finance), and summarizes results.
 
 ## Tasks
-- `get_company_ciks()`
-  - Downloads `company_tickers.json` and returns a filtered CIK list.
-  - Applies `SEC_START_CIK` and `SEC_MAX_CIKS_PER_RUN`.
-- `fetch_and_store_all_companies()`
-  - Always downloads `submissions.json`.
-  - Checks `metadata.json` to detect new filings.
-  - Downloads `companyfacts.json` only when new filings exist.
-  - Writes `metadata.json` with `latest_filing_date` and `last_updated`.
-  - Stores JSON locally or in S3.
-- `ingest_to_postgres()`
-  - Converts JSON to NDJSON files.
-  - Upserts `metric_metadata` (label, description) for each metric encountered.
-  - Loads into PostgreSQL `sec_raw` tables using DELETE + INSERT per file.
-  - Commits per file for progress visibility and failure resilience.
-- `validate_postgres_ingestion()`
-  - Row count validation for submissions table.
-  - NULL check on required CIK field.
-  - Array alignment check (tickers vs exchanges JSONB arrays).
-  - Data type validation (fiscal_year numeric).
-  - Primary key uniqueness check.
-  - Raises `AirflowFailException` for critical failures.
-- `summarize()`
-  - Logs counts for processed companies and facts downloaded vs skipped.
 
-## DAG Flow
+- **get_company_ciks()**  
+  Downloads `company_tickers.json` and returns a filtered list of companies. Applies `SEC_START_CIK` and `SEC_MAX_CIKS_PER_RUN`.
+
+- **fetch_and_store_companies(companies)**  
+  For each company: downloads `submissions.json`; checks `metadata.json` for latest filing date; downloads `companyfacts.json` only when new filings exist; writes `metadata.json`; stores JSON locally or in S3. Writes results incrementally to `processing_results.jsonl`.
+
+- **ingest_to_postgres(summary)**  
+  Converts JSON to NDJSON, upserts `metric_metadata`, and loads into `sec_raw` tables (submissions, companyfacts_metadata, companyfacts_facts). Skips CIKs already present for the current ingest date (idempotent). Returns processed / errors / skipped counts.
+
+- **validate_postgres_ingestion(ingest_result)**  
+  Row count, NULL CIK, array alignment (tickers vs exchanges), data type (fiscal_year), primary key uniqueness. Raises on critical failures.
+
+- **fetch_ticker_prices(validated)**  
+  Fetches daily OHLCV for tracked tickers (from `submissions_ticker_mapping`, latest ingest, likely common stock) via Yahoo Finance (yfinance) and upserts into `sec_raw.ticker_prices_daily`. Uses Airflow logical date (`ds`) so backfills get historical prices.
+
+- **summarize(stored)**  
+  Logs processing summary (companies, facts downloaded/skipped, results file). Handles both summary-dict and legacy list formats.
+
+## DAG flow
+
 ```
-get_company_ciks → fetch_and_store_all_companies → ingest_to_postgres → validate_postgres_ingestion → summarize
+get_company_ciks → fetch_and_store_companies → ingest_to_postgres → validate_postgres_ingestion → fetch_ticker_prices → summarize(stored)
 ```
 
-## Normalized Schema
-The `companyfacts_facts` table does not store metric labels or descriptions.
-These fields live in the `metric_metadata` reference table (keyed by taxonomy +
-metric_name) and are joined via the `companyfacts_facts_full` view.
+## Storage layout (local)
 
-During ingestion, new metrics are upserted into `metric_metadata` so labels and
-descriptions stay current as new metrics appear in SEC filings.
-
-## Storage Layout (Local)
 `/opt/airflow/data/sec_raw/cik={CIK}/`
+
 - `submissions.json`
 - `companyfacts.json` (optional when no new filings)
 - `metadata.json`
-- `processing_results.jsonl` (run summary entries)
+- `processing_results.jsonl` (run summary)
 
-## Incremental Behavior
-- Uses `metadata.json.latest_filing_date` to decide whether to fetch
-  `companyfacts.json` for a CIK.
-- `submissions.json` is always refreshed.
+## Incremental / idempotent behavior
+
+- **Fetch**: `metadata.json.latest_filing_date` determines whether to fetch `companyfacts.json`. `submissions.json` is always refreshed.
+- **Ingest**: CIKs that already have a row in `submissions` for the current ingest date are skipped so the same facts are not re-imported on re-runs.

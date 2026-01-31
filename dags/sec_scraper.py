@@ -63,15 +63,15 @@ default_args = {
     "retry_delay": timedelta(minutes=2),
 }
 
-with DAG(
-    dag_id="sec_scraper",
-    description="Download SEC EDGAR company submissions + facts JSON into raw storage",
-    default_args=default_args,
-    start_date=datetime(2025, 1, 1),
-    schedule="0 6 * * *",  # daily at 06:00
-    catchup=False,
-    max_active_runs=1,
-    tags=["sec", "edgar", "finance"],
+with DAG(  # type: ignore[call-arg]
+    dag_id="sec_scraper",  # type: ignore[call-arg]
+    description="Download SEC EDGAR company submissions + facts JSON into raw storage",  # type: ignore[call-arg]
+    default_args=default_args,  # type: ignore[call-arg]
+    start_date=datetime(2025, 1, 1),  # type: ignore[call-arg]
+    schedule="0 6 * * *",  # daily at 06:00  # type: ignore[call-arg]
+    catchup=False,  # type: ignore[call-arg]
+    max_active_runs=1,  # type: ignore[call-arg]
+    tags=["sec", "edgar", "finance"],  # type: ignore[call-arg]
 ) as dag:
 
     @task
@@ -141,9 +141,10 @@ with DAG(
         try:
             result = _ingest(cfg)
             logger.info(
-                "Ingestion complete: %d CIKs processed, %d errors",
+                "Ingestion complete: %d CIKs processed, %d errors, %d skipped (already ingested)",
                 result.get("processed", 0),
                 result.get("errors", 0),
+                result.get("skipped", 0),
             )
             return result
         except RuntimeError as e:
@@ -161,10 +162,30 @@ with DAG(
         except RuntimeError as e:
             raise AirflowFailException(str(e))
 
+    @task
+    def fetch_ticker_prices(_: Dict[str, Any]) -> Dict[str, Any]:
+        """Fetch daily ticker prices and upsert into PostgreSQL."""
+        # Use Airflow logical date so backfills pull historical prices.
+        from airflow.operators.python import get_current_context  # type: ignore
+
+        context = get_current_context()
+        ds = str(context.get("ds", "")).strip()
+
+        cfg = _settings()
+        s = _session(cfg.user_agent)
+        from scripts.sec_scraper.tasks.fetch_ticker_prices import (
+            fetch_ticker_prices as _fetch_prices,
+        )
+        try:
+            return _fetch_prices(cfg, s, price_date=ds or None)
+        except RuntimeError as e:
+            raise AirflowFailException(str(e))
+
     companies = get_company_ciks()
     stored = fetch_and_store_companies(companies)
     ingested = ingest_to_postgres(stored)
     validated = validate_postgres_ingestion(ingested)
+    prices = fetch_ticker_prices(validated)
 
     # Task dependencies
-    _ = companies >> Label("download SEC JSON + store raw") >> stored >> Label("ingest to PostgreSQL") >> ingested >> Label("validate") >> validated >> summarize(stored)  # type: ignore[operator]
+    _ = companies >> Label("download SEC JSON + store raw") >> stored >> Label("ingest to PostgreSQL") >> ingested >> Label("validate") >> validated >> Label("fetch daily prices") >> prices >> summarize(stored)  # type: ignore[operator]
