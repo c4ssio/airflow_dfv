@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc:*)",
+      "Bash(python3:*)",
+      "Bash(ls:*)",
+      "Bash(docker compose exec:*)",
+      "WebSearch",
+      "WebFetch(domain:xbrl.fasb.org)",
+      "WebFetch(domain:xbrl.us)"
+    ]
+  }
+}

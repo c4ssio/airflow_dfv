@@ -57,19 +57,21 @@ python deploy_migrations.py --config /path/to/postgres.yaml
 | `202512221200__create_submissions_ticker_mapping` | View expanding ticker/exchange arrays to rows |
 | `202512221300__create_us_gaap_metric_abbreviations` | Initial metric abbreviations reference table |
 | `202501231500__normalize_metric_metadata` | Renames to metric_metadata, adds label/description, creates companyfacts_facts_full view, removes redundant columns from facts |
+| `202601281200__create_ticker_prices_daily` | Daily OHLCV by (ticker, price_date); source e.g. yahoo |
 
 ## Current Schema
 
 ### Tables
-- **submissions** - Company metadata, JSONB arrays for tickers/exchanges/filings/addresses
+- **submissions** - Company metadata, JSONB arrays for tickers/exchanges/filings/addresses. PK: (cik, ingest_date). Used to skip already-ingested CIKs on re-runs.
 - **companyfacts_metadata** - Per-company facts metadata (entity name, ingest date)
 - **companyfacts_facts** - Normalized financial metrics (no label/description; join via view)
 - **metric_metadata** - Canonical metric reference (taxonomy + metric_name PK, label, description, abbreviation, category)
+- **ticker_prices_daily** - Daily OHLCV by (ticker, price_date); source (e.g. yahoo), fetched_at. For cheapness/valuation.
 
 ### Views
 - **companyfacts_facts_full** - Facts joined with metric_metadata (label, description, abbreviation, category)
 - **companyfacts_facts_with_abbrev** - Alias for companyfacts_facts_full
-- **submissions_ticker_mapping** - Expands JSONB ticker/exchange arrays to rows
+- **submissions_ticker_mapping** - Expands JSONB ticker/exchange arrays to rows; used by fetch_ticker_prices to select tickers
 
 ## Migration Tracking
 

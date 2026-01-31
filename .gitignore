@@ -9,8 +9,7 @@ airflow.cfg
 data/
 tmp/
 *.parquet
-*.csv
-*.json
+
 
 # ----------------------
 # Python artifacts
@@ -41,7 +40,6 @@ compose.override.yml
 # ----------------------
 .DS_Store
 .idea/
-.vscode/
 *.swp
 
 # ----------------------
@@ -63,6 +61,9 @@ build/
 
 # Local diagnostics produced by helper scripts
 diagnostics/
+
+# Editor configuration we *do* want in git
+!.vscode/settings.json
 
 # Local config with generated secrets
 config/
