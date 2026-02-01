@@ -56,7 +56,7 @@ python deploy_migrations.py --config /path/to/postgres.yaml
 | `202512221100__create_companyfacts` | companyfacts_metadata and companyfacts_facts tables |
 | `202512221200__create_submissions_ticker_mapping` | View expanding ticker/exchange arrays to rows |
 | `202512221300__create_us_gaap_metric_abbreviations` | Initial metric abbreviations reference table |
-| `202501231500__normalize_metric_metadata` | Renames to metric_metadata, adds label/description, creates companyfacts_facts_full view, removes redundant columns from facts |
+| `202512221400__normalize_metric_metadata` | Renames to metric_metadata, adds label/description, creates companyfacts_facts_full view, removes redundant columns from facts |
 | `202601281200__create_ticker_prices_daily` | Daily OHLCV by (ticker, price_date); source e.g. yahoo |
 
 ## Current Schema
