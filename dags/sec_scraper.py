@@ -181,11 +181,29 @@ with DAG(  # type: ignore[call-arg]
         except RuntimeError as e:
             raise AirflowFailException(str(e))
 
+    @task
+    def score_company_valuations(_: Dict[str, Any]) -> Dict[str, Any]:
+        """Compute Berkshire-style cheapness/quality scores for all companies."""
+        from airflow.operators.python import get_current_context  # type: ignore
+
+        context = get_current_context()
+        ds = str(context.get("ds", "")).strip()
+
+        cfg = _settings()
+        from scripts.sec_scraper.tasks.company_valuation_score import (
+            compute_valuation_scores as _score,
+        )
+        try:
+            return _score(cfg, score_date=ds or None)
+        except RuntimeError as e:
+            raise AirflowFailException(str(e))
+
     companies = get_company_ciks()
     stored = fetch_and_store_companies(companies)
     ingested = ingest_to_postgres(stored)
     validated = validate_postgres_ingestion(ingested)
     prices = fetch_ticker_prices(validated)
+    scores = score_company_valuations(prices)
 
     # Task dependencies
-    _ = companies >> Label("download SEC JSON + store raw") >> stored >> Label("ingest to PostgreSQL") >> ingested >> Label("validate") >> validated >> Label("fetch daily prices") >> prices >> summarize(stored)  # type: ignore[operator]
+    _ = companies >> Label("download SEC JSON + store raw") >> stored >> Label("ingest to PostgreSQL") >> ingested >> Label("validate") >> validated >> Label("fetch daily prices") >> prices >> Label("score valuations") >> scores >> summarize(stored)  # type: ignore[operator]
