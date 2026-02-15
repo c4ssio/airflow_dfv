@@ -28,8 +28,16 @@ airflow_dfv/
 │   │   ├── migrations/             # SQL DDL files (YYYYMMDDHHMM__description.sql)
 │   │   └── README.md
 │   └── tests/
-│       ├── test_common_converters.py
-│       └── test_fetch_company_ciks.py
+│       ├── conftest.py                 # Stubs for airflow/yfinance/psycopg2 (host testing)
+│       ├── test_common.py              # load_settings, make_session, rate_limit, get_json
+│       ├── test_common_converters.py   # pad_cik, validators, NDJSON converters
+│       ├── test_fetch_company_ciks.py  # fetch_company_ciks
+│       ├── test_fetch_and_store_companies.py  # process_single_company, estimate_results_size_mb
+│       ├── test_fetch_ticker_prices.py # PriceBar, _to_float/int, Stooq CSV parsing
+│       ├── test_ingest_to_postgres.py  # _discover_cik_dirs, _build_ndjson_for_cik, ingest_ciks
+│       ├── test_postgres_helpers.py    # get_postgres_config, write_ndjson_file
+│       ├── test_storage.py             # s3_key, write_bytes, metadata, find_existing_data
+│       └── test_validate_postgres_ingestion.py  # All 5 validation scenarios
 ├── scripts/
 │   ├── setup_venv.sh               # Create Python venv on the host
 │   ├── run_with_venv.sh            # Run commands inside the venv
@@ -178,6 +186,9 @@ docker compose exec airflow-worker python -m pytest /opt/airflow/plugins/scripts
 - pytest is configured via `pytest.ini` (testpaths, pythonpath).
 - Use dependency injection: pass `Settings` and `requests.Session` as parameters so tests can supply fakes (see `DummySession` in `test_fetch_company_ciks.py`).
 - Test function names should describe the behavior being tested: `test_<function>_<scenario>`.
+- **Host-side stubs**: `conftest.py` provides lightweight stubs for `airflow`, `yfinance`, and `psycopg2` so tests run on the host without the full Docker stack. Stubs are only registered when the real module is not installed.
+- **DB-dependent functions**: Test via their callers using dependency injection and mock connections (e.g., `_FakeLoadFns` in `test_ingest_to_postgres.py`, `_FakeCursor`/`_FakeConn` in `test_validate_postgres_ingestion.py`).
+- **New task tests**: When adding a new task module, add a corresponding `test_<module>.py` file. Use the `_make_settings()` helper pattern (see any existing test file) to create `Settings` instances with sensible defaults.
 
 ### Type Checking
 
