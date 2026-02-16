@@ -3,6 +3,21 @@ resource "random_password" "db" {
   special = false
 }
 
+resource "random_password" "airflow_admin" {
+  length  = 24
+  special = false
+}
+
+resource "random_password" "fernet_key" {
+  length  = 32
+  special = false
+}
+
+resource "random_password" "internal_api_secret" {
+  length  = 32
+  special = false
+}
+
 resource "aws_db_subnet_group" "main" {
   name       = "${var.project_name}-db-subnet"
   subnet_ids = aws_subnet.private[*].id

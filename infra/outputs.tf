@@ -28,3 +28,19 @@ output "db_password" {
   value       = random_password.db.result
   sensitive   = true
 }
+
+output "airflow_admin_password" {
+  description = "Generated Airflow admin UI password (username: admin)"
+  value       = random_password.airflow_admin.result
+  sensitive   = true
+}
+
+output "jumpbox_public_ip" {
+  description = "Jumpbox Elastic IP (persists across stop/start)"
+  value       = aws_eip.jumpbox.public_ip
+}
+
+output "jumpbox_instance_id" {
+  description = "Jumpbox EC2 instance ID (for SSM Session Manager)"
+  value       = aws_instance.jumpbox.id
+}
