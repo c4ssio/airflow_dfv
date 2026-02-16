@@ -67,7 +67,9 @@ airflow_dfv/
 │   └── aws/                        # AWS deployment scripts
 │       ├── build_and_push.sh       # Build Docker image and push to ECR
 │       ├── deploy.sh               # Full deploy: terraform apply → build → init → redeploy
-│       └── teardown.sh             # Scale down ECS + terraform destroy
+│       ├── teardown.sh             # Scale down ECS + terraform destroy
+│       ├── stop_stack.sh           # Stop stack to save costs (ECS→0, RDS stop, EC2 stop)
+│       └── start_stack.sh          # Start stack back up (reverse of stop)
 ├── config/                         # gitignored — secrets.env, postgres.yaml
 ├── compose.yaml                    # Docker Compose (all services)
 ├── Dockerfile                      # Extends apache/airflow:3.1.5
@@ -399,7 +401,7 @@ curl http://<alb-url>:8080/api/v2/monitor/health
 
 ## Jumpbox
 
-A t3.micro EC2 instance in a public subnet for admin tasks (terraform, ECS exec, database access). Managed in `infra/jumpbox.tf`.
+A t3.micro EC2 instance in a public subnet for admin tasks (terraform, ECS exec, database access). Managed in `infra/jumpbox.tf`. Uses an **Elastic IP** so the address persists across stop/start cycles — no need to update security groups or SSH configs when restarting.
 
 ### What's Installed
 
@@ -517,6 +519,7 @@ When you need to update a running service's config without terraform (e.g., addi
 | ALB security group | `sg-041181b4ade7d74f7` |
 | Jumpbox security group | `sg-02704825b173677e0` |
 | Jumpbox instance | `i-08608d20f790c623f` |
+| Jumpbox Elastic IP | `44.198.7.177` (`eipalloc-0f95920bc202f2538`) |
 | ALB DNS | `sec-scraper-alb-2104629405.us-east-1.elb.amazonaws.com` |
 | CloudWatch log group | `/ecs/sec-scraper` |
 
@@ -526,6 +529,51 @@ When you need to update a running service's config without terraform (e.g., addi
 - Health endpoint moved to `/api/v2/monitor/health` (not `/health`).
 - API uses JWT tokens via `/auth/token`, not basic auth.
 - DAGs are paused at creation on ECS (`AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=true`). Always `unpause` before triggering.
+
+## On-Demand Stack (Cost Management)
+
+The stack can be stopped and started on demand to save costs when not in use.
+
+### Stop the Stack
+
+```bash
+./scripts/aws/stop_stack.sh            # Stop ECS, RDS, jumpbox
+./scripts/aws/stop_stack.sh --delete-redis  # Also delete Redis (saves ~$12/mo)
+```
+
+**What gets stopped (free when stopped):**
+- ECS Fargate services → scaled to 0
+- RDS PostgreSQL → stopped (note: AWS auto-restarts after 7 days)
+- Jumpbox EC2 → stopped (Elastic IP retained, same IP on restart)
+
+**What keeps running (baseline cost when stopped):**
+
+| Resource | Monthly Cost | Notes |
+|----------|-------------|-------|
+| NAT Gateway | ~$32 | Required for private subnet internet |
+| ALB | ~$16 | Keeps DNS stable |
+| ElastiCache Redis | ~$12 | Cannot be stopped; use `--delete-redis` to remove |
+| EIP | $0 | Free when attached (even to stopped instance) |
+| EFS | ~$0.30/GB | Minimal unless storing lots of data |
+
+### Start the Stack
+
+```bash
+./scripts/aws/start_stack.sh              # Start everything back up
+./scripts/aws/start_stack.sh --create-redis  # Also recreate Redis if deleted
+```
+
+The start script waits for RDS to become available before scaling up ECS services. Full startup takes ~5 minutes.
+
+### Full Teardown (Destroy Everything)
+
+To completely destroy all resources (irreversible):
+
+```bash
+./scripts/aws/teardown.sh --yes
+```
+
+This runs `terraform destroy` and removes all AWS resources including data.
 
 ## Notes for Changes
 

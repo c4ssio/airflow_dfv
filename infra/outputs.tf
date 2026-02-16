@@ -36,8 +36,8 @@ output "airflow_admin_password" {
 }
 
 output "jumpbox_public_ip" {
-  description = "Jumpbox public IP for SSH access"
-  value       = aws_instance.jumpbox.public_ip
+  description = "Jumpbox Elastic IP (persists across stop/start)"
+  value       = aws_eip.jumpbox.public_ip
 }
 
 output "jumpbox_instance_id" {

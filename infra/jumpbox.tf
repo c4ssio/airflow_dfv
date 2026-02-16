@@ -1,5 +1,6 @@
 # --- Jumpbox EC2 Instance ---
 # Small instance in public subnet for running terraform, ECS exec, and ad-hoc admin.
+# Uses an Elastic IP so the address persists across stop/start cycles.
 
 data "aws_ssm_parameter" "al2023_ami" {
   name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
@@ -67,7 +68,7 @@ resource "aws_instance" "jumpbox" {
   subnet_id                   = aws_subnet.public[0].id
   vpc_security_group_ids      = [aws_security_group.jumpbox.id]
   iam_instance_profile        = aws_iam_instance_profile.jumpbox.name
-  associate_public_ip_address = true
+  associate_public_ip_address = false # Using EIP instead
 
   user_data = <<-EOF
     #!/bin/bash
@@ -85,4 +86,14 @@ resource "aws_instance" "jumpbox" {
   EOF
 
   tags = { Name = "${var.project_name}-jumpbox", Environment = "ephemeral" }
+}
+
+resource "aws_eip" "jumpbox" {
+  domain = "vpc"
+  tags   = { Name = "${var.project_name}-jumpbox-eip", Environment = "ephemeral" }
+}
+
+resource "aws_eip_association" "jumpbox" {
+  instance_id   = aws_instance.jumpbox.id
+  allocation_id = aws_eip.jumpbox.id
 }
