@@ -14,6 +14,7 @@ resource "aws_secretsmanager_secret_version" "app" {
     POSTGRES_USER     = var.db_username
     POSTGRES_PASSWORD = random_password.db.result
     POSTGRES_SCHEMA   = "sec_raw"
-    SEC_USER_AGENT    = var.sec_user_agent
+    SEC_USER_AGENT         = var.sec_user_agent
+    AIRFLOW_ADMIN_PASSWORD = random_password.airflow_admin.result
   })
 }

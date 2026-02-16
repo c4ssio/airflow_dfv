@@ -3,6 +3,11 @@ resource "random_password" "db" {
   special = false
 }
 
+resource "random_password" "airflow_admin" {
+  length  = 24
+  special = false
+}
+
 resource "aws_db_subnet_group" "main" {
   name       = "${var.project_name}-db-subnet"
   subnet_ids = aws_subnet.private[*].id

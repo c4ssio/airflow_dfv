@@ -43,15 +43,16 @@ airflow_dfv/
 │   ├── variables.tf                # Input variables (region, instance sizes, CIDR, etc.)
 │   ├── outputs.tf                  # ALB URL, RDS/Redis endpoints, ECR repo URL
 │   ├── vpc.tf                      # VPC, 2 public + 2 private subnets, IGW, NAT, routes
-│   ├── security_groups.tf          # 5 SGs: ALB, ECS, RDS, Redis, EFS
+│   ├── security_groups.tf          # 6 SGs: ALB, ECS, RDS, Redis, EFS, Jumpbox
 │   ├── ecr.tf                      # ECR repository + lifecycle policy
-│   ├── rds.tf                      # RDS PostgreSQL 15 (db.t4g.micro)
+│   ├── rds.tf                      # RDS PostgreSQL 15 (db.t4g.micro), random passwords
 │   ├── elasticache.tf              # ElastiCache Redis 7 (cache.t4g.micro)
 │   ├── efs.tf                      # EFS + access points for data/logs (UID 50000)
-│   ├── secrets.tf                  # Secrets Manager for DB credentials
+│   ├── secrets.tf                  # Secrets Manager for DB + Airflow admin credentials
 │   ├── iam.tf                      # Execution role + task role, CloudWatch log group
 │   ├── alb.tf                      # ALB on port 8080 with health checks
 │   ├── ecs.tf                      # ECS Fargate cluster, 6 task defs, 5 services
+│   ├── jumpbox.tf                  # Jumpbox EC2 in public subnet (terraform, ECS exec)
 │   └── terraform.tfvars.example    # Example variable values
 ├── scripts/
 │   ├── setup_venv.sh               # Create Python venv on the host
@@ -290,8 +291,9 @@ The `infra/` directory contains Terraform configuration for deploying the full A
 | Storage | EFS (data + logs) | Bursting throughput |
 | Load Balancer | ALB on port 8080 | — |
 | Container Registry | ECR | Keep last 5 images |
-| Secrets | Secrets Manager | DB credentials (auto-generated) |
+| Secrets | Secrets Manager | DB + Airflow admin credentials |
 | Logs | CloudWatch | 7-day retention |
+| Jumpbox | EC2 t3.micro in public subnet | SSH + SSM access |
 
 ### ECS Naming Conventions
 
@@ -354,6 +356,176 @@ State is stored locally in `infra/terraform.tfstate` (gitignored). For team use,
 - **Private subnets**: RDS, Redis, EFS, and ECS tasks are in private subnets; only the ALB is public.
 - **IAM least-privilege**: Execution role has ECR pull + Secrets Manager read; task role has EFS mount + SSM messages (for `execute-command`).
 - **Never commit**: `infra/terraform.tfstate`, `infra/.terraform/`, or `infra/terraform.tfvars` (all gitignored).
+
+## Airflow UI Access (ECS)
+
+The ECS deployment uses Airflow 3's **Simple Auth Manager** for UI/API authentication.
+
+- **Username:** `admin`
+- **Password:** Auto-generated at deploy time via `random_password.airflow_admin` in Terraform.
+- **Retrieve password:** `cd infra && terraform output -raw airflow_admin_password`
+- **ALB URL:** Available via `terraform output alb_url` (format: `http://<alb-dns>:8080`)
+
+### How It Works
+
+The api-server container uses an entrypoint wrapper that writes the password file before starting Airflow:
+```
+echo '{"admin": "$AIRFLOW_ADMIN_PASSWORD"}' > /opt/airflow/simple_auth_manager_passwords.json.generated
+exec airflow api-server
+```
+
+The `AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS` env var (set to `admin:admin`) defines the user and role. The `AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE` env var points to the generated file. Only the api-server needs this — other services don't serve the UI.
+
+### API Authentication (Airflow 3.x)
+
+Airflow 3.x does **not** use basic auth for API calls. To authenticate programmatically:
+
+1. Get a JWT token:
+   ```bash
+   curl -X POST http://<alb-url>:8080/auth/token \
+     -H "Content-Type: application/json" \
+     -d '{"username":"admin","password":"<password>"}'
+   ```
+2. Use the token in subsequent requests:
+   ```bash
+   curl -H "Authorization: Bearer <token>" http://<alb-url>:8080/api/v2/dags
+   ```
+
+### Health Check (no auth required)
+
+```bash
+curl http://<alb-url>:8080/api/v2/monitor/health
+```
+
+## Jumpbox
+
+A t3.micro EC2 instance in a public subnet for admin tasks (terraform, ECS exec, database access). Managed in `infra/jumpbox.tf`.
+
+### What's Installed
+
+- Terraform
+- AWS CLI (via instance profile with AdministratorAccess)
+- Docker
+- SSM Session Manager plugin
+- Git
+
+### Access
+
+```bash
+# SSH (requires the remote_cursor_key private key)
+ssh -i ~/.ssh/remote_cursor_key ec2-user@$(cd infra && terraform output -raw jumpbox_public_ip)
+
+# SSM Session Manager (no SSH key needed, requires AWS CLI locally)
+aws ssm start-session --target $(cd infra && terraform output -raw jumpbox_instance_id)
+```
+
+### Running Terraform from the Jumpbox
+
+```bash
+ssh ec2-user@<jumpbox-ip>
+cd ~/projects/airflow_dfv/infra
+terraform init
+terraform apply
+```
+
+### Triggering DAG Runs from the Jumpbox
+
+```bash
+# Via Airflow CLI (one-off ECS task)
+aws ecs run-task --cluster sec-scraper-cluster \
+  --task-definition sec-scraper-worker --launch-type FARGATE \
+  --network-configuration '{
+    "awsvpcConfiguration": {
+      "subnets": ["<private-subnet-1>", "<private-subnet-2>"],
+      "securityGroups": ["<ecs-sg>"],
+      "assignPublicIp": "DISABLED"
+    }
+  }' \
+  --overrides '{
+    "containerOverrides": [{
+      "name": "worker",
+      "command": ["bash", "-c", "airflow dags unpause sec_scraper && airflow dags trigger sec_scraper"]
+    }]
+  }'
+
+# Via ECS exec (interactive, on running worker)
+TASK_ID=$(aws ecs list-tasks --cluster sec-scraper-cluster \
+  --service-name sec-scraper-worker --query 'taskArns[0]' --output text)
+aws ecs execute-command --cluster sec-scraper-cluster --task "$TASK_ID" \
+  --container worker --interactive --command bash
+```
+
+### Redeploying Services from the Jumpbox
+
+```bash
+# After code changes — rebuild image and push
+cd ~/projects/airflow_dfv
+./scripts/aws/build_and_push.sh
+
+# Force ECS to pull the new image
+aws ecs update-service --cluster sec-scraper-cluster \
+  --service sec-scraper-worker --force-new-deployment
+# Repeat for other services as needed
+```
+
+## Operational Notes for Claude Code Sessions
+
+### AWS Credentials
+
+When connecting to the AWS account from a Claude Code session (without jumpbox access):
+
+- **AWS CLI is not pre-installed** — install with `pip install awscli`.
+- Set credentials via env vars: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION=us-east-1`.
+- **Cannot run `terraform apply`** — use the jumpbox for terraform operations.
+- **Cannot use `aws ecs execute-command`** — requires SSM Session Manager plugin (not available in Claude Code sandbox).
+
+### Running Airflow CLI Commands Remotely
+
+Without jumpbox/SSM access, use `aws ecs run-task` with command overrides to run Airflow CLI commands. The container takes ~30-60s to start (Fargate provisioning). Check logs via CloudWatch:
+
+```bash
+# Run a command
+aws ecs run-task --cluster sec-scraper-cluster \
+  --task-definition sec-scraper-worker --launch-type FARGATE \
+  --network-configuration '{"awsvpcConfiguration":{"subnets":["<subnet-1>","<subnet-2>"],"securityGroups":["<ecs-sg>"],"assignPublicIp":"DISABLED"}}' \
+  --overrides '{"containerOverrides":[{"name":"worker","command":["bash","-c","<your-command>"]}]}'
+
+# Check output (task ID from the run-task response)
+aws logs get-log-events --log-group-name /ecs/sec-scraper \
+  --log-stream-name worker/worker/<task-id> \
+  --query 'events[].message' --output text
+```
+
+### Updating ECS Task Definitions Without Terraform
+
+When you need to update a running service's config without terraform (e.g., adding env vars):
+
+1. `aws ecs describe-task-definition --task-definition <name>` → save JSON
+2. Modify the container definition (add env vars, change command, etc.)
+3. Remove non-registerable fields (`taskDefinitionArn`, `revision`, `status`, `requiresAttributes`, `compatibilities`, `registeredAt`, `registeredBy`, `enableFaultInjection`)
+4. `aws ecs register-task-definition --cli-input-json file://modified.json`
+5. `aws ecs update-service --cluster sec-scraper-cluster --service <name> --task-definition <name>:<new-revision> --force-new-deployment`
+
+### Key Resource IDs (Current Deployment)
+
+| Resource | Value |
+|----------|-------|
+| VPC | `vpc-068394bf0f50bb05b` |
+| Private subnets | `subnet-0b9d77ddeb71d38fc`, `subnet-0bc236aee1170c5f5` |
+| Public subnets | `subnet-048aef579a62e1f3b`, `subnet-0870391697fc216c4` |
+| ECS security group | `sg-04d71ebe55272f655` |
+| ALB security group | `sg-041181b4ade7d74f7` |
+| Jumpbox security group | `sg-02704825b173677e0` |
+| Jumpbox instance | `i-08608d20f790c623f` |
+| ALB DNS | `sec-scraper-alb-2104629405.us-east-1.elb.amazonaws.com` |
+| CloudWatch log group | `/ecs/sec-scraper` |
+
+### Airflow 3.x CLI Differences
+
+- `airflow dags list-runs` syntax changed from Airflow 2. Use `airflow dags list-runs <dag_id>` (no `-d` flag).
+- Health endpoint moved to `/api/v2/monitor/health` (not `/health`).
+- API uses JWT tokens via `/auth/token`, not basic auth.
+- DAGs are paused at creation on ECS (`AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=true`). Always `unpause` before triggering.
 
 ## Notes for Changes
 

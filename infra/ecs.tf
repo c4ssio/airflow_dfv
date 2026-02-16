@@ -29,6 +29,9 @@ locals {
     { name = "POSTGRES_USER", value = local.rds_user },
     { name = "POSTGRES_PASSWORD", value = local.rds_password },
     { name = "POSTGRES_SCHEMA", value = "sec_raw" },
+    { name = "AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS", value = "admin:admin" },
+    { name = "AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE", value = "/opt/airflow/simple_auth_manager_passwords.json.generated" },
+    { name = "AIRFLOW_ADMIN_PASSWORD", value = random_password.airflow_admin.result },
   ]
 
   efs_volumes = [
@@ -126,7 +129,8 @@ resource "aws_ecs_task_definition" "api_server" {
     name      = "api-server"
     image     = local.image
     essential = true
-    command   = ["api-server"]
+    entryPoint = ["/bin/bash", "-c"]
+    command   = ["echo \"{\\\"admin\\\": \\\"$AIRFLOW_ADMIN_PASSWORD\\\"}\" > /opt/airflow/simple_auth_manager_passwords.json.generated && exec airflow api-server"]
 
     portMappings = [{
       containerPort = 8080
