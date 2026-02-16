@@ -51,6 +51,9 @@ compose.override.yml
 *.key
 *.crt
 
+# Claude Code local settings (may contain AWS credentials)
+.claude/settings.local.json
+
 # ----------------------
 # Build artifacts
 # ----------------------
