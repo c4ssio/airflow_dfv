@@ -1,7 +1,8 @@
 """Tests for tasks/fetch_ticker_prices.py.
 
 Covers: PriceBar, _to_float, _to_int, _iter_stooq_daily_csv_rows,
-        _stooq_symbol_for_ticker, _fetch_stooq_bar_for_date.
+        _stooq_symbol_for_ticker, _fetch_stooq_bar_for_date,
+        _get_last_price_date.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import requests
 from scripts.sec_scraper.tasks.fetch_ticker_prices import (
     PriceBar,
     _fetch_stooq_bar_for_date,
+    _get_last_price_date,
     _iter_stooq_daily_csv_rows,
     _stooq_symbol_for_ticker,
     _to_float,
@@ -234,3 +236,41 @@ def test_fetch_stooq_bar_for_date_returns_none_when_all_dates_after():
         session, ticker="FUTURE", price_date="2025-06-14", timeout_s=5, rps=0,
     )
     assert bar is None
+
+
+# ---------------------------------------------------------------------------
+# _get_last_price_date (uses a fake cursor/connection)
+# ---------------------------------------------------------------------------
+
+class _FakeCursor:
+    def __init__(self, result: Any = None):
+        self._result = result
+
+    def execute(self, sql, params=None):
+        pass
+
+    def fetchone(self):
+        return self._result
+
+    def close(self):
+        pass
+
+
+class _FakeConn:
+    def __init__(self, cursor_result: Any = None):
+        self._cursor_result = cursor_result
+
+    def cursor(self):
+        return _FakeCursor(self._cursor_result)
+
+
+def test_get_last_price_date_returns_date():
+    conn = _FakeConn(cursor_result=("2025-12-01",))
+    result = _get_last_price_date(conn, "sec_raw")
+    assert result == "2025-12-01"
+
+
+def test_get_last_price_date_returns_none_on_empty():
+    conn = _FakeConn(cursor_result=(None,))
+    result = _get_last_price_date(conn, "sec_raw")
+    assert result is None

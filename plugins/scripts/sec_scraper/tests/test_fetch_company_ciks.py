@@ -81,3 +81,18 @@ def test_fetch_company_ciks_respects_start_cik_and_max_ciks():
     assert len(rows) == 1
     assert rows[0]["cik"] == "2000"
 
+
+def test_fetch_company_ciks_max_ciks_zero_returns_all():
+    """max_ciks=0 should return all companies (no limit)."""
+    payload: Dict[str, Any] = {
+        "0": {"cik_str": 1000, "ticker": "AAA", "title": "Alpha Corp"},
+        "1": {"cik_str": 2000, "ticker": "BBB", "title": "Beta Corp"},
+        "2": {"cik_str": 3000, "ticker": "CCC", "title": "Gamma Corp"},
+    }
+    cfg = _make_settings(max_ciks=0)
+    session = DummySession(payload)
+
+    rows = fetch_company_ciks(cfg, session, "https://example.com/company_tickers.json")
+
+    assert len(rows) == 3
+
