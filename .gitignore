@@ -51,6 +51,18 @@ compose.override.yml
 *.key
 *.crt
 
+# Claude Code local settings (may contain AWS credentials)
+.claude/settings.local.json
+
+# ----------------------
+# Terraform (never commit state or secrets)
+# ----------------------
+infra/.terraform/
+infra/terraform.tfstate
+infra/terraform.tfstate.backup
+infra/.terraform.lock.hcl
+infra/terraform.tfvars
+
 # ----------------------
 # Build artifacts
 # ----------------------

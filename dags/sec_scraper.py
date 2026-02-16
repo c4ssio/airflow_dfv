@@ -68,7 +68,7 @@ with DAG(  # type: ignore[call-arg]
     description="Download SEC EDGAR company submissions + facts JSON into raw storage",  # type: ignore[call-arg]
     default_args=default_args,  # type: ignore[call-arg]
     start_date=datetime(2025, 1, 1),  # type: ignore[call-arg]
-    schedule="0 6 * * *",  # daily at 06:00  # type: ignore[call-arg]
+    schedule=None,  # trigger-only (was: "0 6 * * *")  # type: ignore[call-arg]
     catchup=False,  # type: ignore[call-arg]
     max_active_runs=1,  # type: ignore[call-arg]
     tags=["sec", "edgar", "finance"],  # type: ignore[call-arg]
@@ -96,10 +96,11 @@ with DAG(  # type: ignore[call-arg]
 
     @task
     def summarize(summary: Dict[str, Any]) -> None:
-        """Summarize the processing results."""
+        """Summarize the processing results and record pipeline run."""
+        from datetime import date as _date
+
         # Handle both old format (list) and new format (summary dict)
         if isinstance(summary, dict) and "results_file" in summary:
-            # New format: summary dict
             total_companies = summary.get("total_companies", 0)
             facts_downloaded = summary.get("facts_downloaded", 0)
             facts_skipped = summary.get("facts_skipped", 0)
@@ -113,7 +114,6 @@ with DAG(  # type: ignore[call-arg]
             if results_file:
                 logger.info("Results written to: %s", results_file)
         else:
-            # Old format: list of results (for backward compatibility)
             results: List[Dict[str, Any]] = summary if isinstance(summary, list) else []
             stored_s3 = sum(1 for r in results if isinstance(r, dict) and r.get("stored") == "s3")
             stored_local = sum(1 for r in results if isinstance(r, dict) and r.get("stored") == "local")
@@ -132,6 +132,25 @@ with DAG(  # type: ignore[call-arg]
             if results:
                 first_result = cast(List[Dict[str, Any]], results)[0] if results else {}
                 logger.debug("Sample output: %s", json.dumps(first_result, indent=2))
+
+        # Record successful run in pipeline_run_log
+        try:
+            cfg = _settings()
+            from scripts.sec_scraper.postgres.helpers import (
+                get_postgres_config,
+                get_postgres_connection,
+            )
+            from scripts.sec_scraper.postgres.run_log import record_completed_run
+
+            pg_cfg = get_postgres_config(cfg.postgres_config_path)
+            schema = pg_cfg.get("schema", "sec_raw")
+            conn = get_postgres_connection(pg_cfg, schema)
+            try:
+                record_completed_run(conn, schema, _date.today().isoformat(), summary)
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning("Failed to record pipeline run: %s", exc)
 
     @task
     def ingest_to_postgres(summary: Dict[str, Any]) -> Dict[str, Any]:
@@ -164,8 +183,11 @@ with DAG(  # type: ignore[call-arg]
 
     @task
     def fetch_ticker_prices(_: Dict[str, Any]) -> Dict[str, Any]:
-        """Fetch daily ticker prices and upsert into PostgreSQL."""
-        # Use Airflow logical date so backfills pull historical prices.
+        """Fetch daily ticker prices and upsert into PostgreSQL.
+
+        Uses backfill mode: queries the DB for the most recent price_date and
+        fills the gap through today (or the Airflow logical date).
+        """
         from airflow.operators.python import get_current_context  # type: ignore
 
         context = get_current_context()
@@ -177,7 +199,7 @@ with DAG(  # type: ignore[call-arg]
             fetch_ticker_prices as _fetch_prices,
         )
         try:
-            return _fetch_prices(cfg, s, price_date=ds or None)
+            return _fetch_prices(cfg, s, price_date=ds or None, backfill=True)
         except RuntimeError as e:
             raise AirflowFailException(str(e))
 

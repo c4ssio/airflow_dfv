@@ -1,0 +1,10 @@
+aws_region     = "us-east-1"
+project_name   = "sec-scraper"
+allowed_cidr   = "YOUR_IP/32"  # Lock ALB to your IP
+sec_user_agent = "drclive SEC scraper (you@drclive.net)"
+
+# Scale up as needed
+# rds_instance_class = "db.t4g.small"
+# redis_node_type    = "cache.t4g.small"
+# worker_cpu         = 2048
+# worker_memory      = 4096

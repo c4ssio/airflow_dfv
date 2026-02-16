@@ -38,6 +38,21 @@ airflow_dfv/
 │       ├── test_postgres_helpers.py    # get_postgres_config, write_ndjson_file
 │       ├── test_storage.py             # s3_key, write_bytes, metadata, find_existing_data
 │       └── test_validate_postgres_ingestion.py  # All 5 validation scenarios
+├── infra/                          # Terraform IaC for AWS deployment
+│   ├── main.tf                     # Provider config (AWS ~> 5.0, random ~> 3.0)
+│   ├── variables.tf                # Input variables (region, instance sizes, CIDR, etc.)
+│   ├── outputs.tf                  # ALB URL, RDS/Redis endpoints, ECR repo URL
+│   ├── vpc.tf                      # VPC, 2 public + 2 private subnets, IGW, NAT, routes
+│   ├── security_groups.tf          # 5 SGs: ALB, ECS, RDS, Redis, EFS
+│   ├── ecr.tf                      # ECR repository + lifecycle policy
+│   ├── rds.tf                      # RDS PostgreSQL 15 (db.t4g.micro)
+│   ├── elasticache.tf              # ElastiCache Redis 7 (cache.t4g.micro)
+│   ├── efs.tf                      # EFS + access points for data/logs (UID 50000)
+│   ├── secrets.tf                  # Secrets Manager for DB credentials
+│   ├── iam.tf                      # Execution role + task role, CloudWatch log group
+│   ├── alb.tf                      # ALB on port 8080 with health checks
+│   ├── ecs.tf                      # ECS Fargate cluster, 6 task defs, 5 services
+│   └── terraform.tfvars.example    # Example variable values
 ├── scripts/
 │   ├── setup_venv.sh               # Create Python venv on the host
 │   ├── run_with_venv.sh            # Run commands inside the venv
@@ -47,7 +62,11 @@ airflow_dfv/
 │   ├── monitor_worker_memory.sh
 │   ├── cleanup_removed_tasks.py    # Remove stale Airflow task metadata
 │   ├── init-sec-db.sql             # Creates sec_data DB on first Postgres startup
-│   └── adhoc/                      # One-off diagnostics (SQL, Python)
+│   ├── adhoc/                      # One-off diagnostics (SQL, Python)
+│   └── aws/                        # AWS deployment scripts
+│       ├── build_and_push.sh       # Build Docker image and push to ECR
+│       ├── deploy.sh               # Full deploy: terraform apply → build → init → redeploy
+│       └── teardown.sh             # Scale down ECS + terraform destroy
 ├── config/                         # gitignored — secrets.env, postgres.yaml
 ├── compose.yaml                    # Docker Compose (all services)
 ├── Dockerfile                      # Extends apache/airflow:3.1.5
@@ -221,6 +240,70 @@ Services defined in `compose.yaml`:
 Volumes mount `dags/`, `plugins/`, `data/`, `config/`, and `logs/` into containers at `/opt/airflow/`.
 
 The `sec_data` database is auto-created via `scripts/init-sec-db.sql` (mounted into Postgres `docker-entrypoint-initdb.d`).
+
+## AWS Deployment (ECS Fargate)
+
+The `infra/` directory contains Terraform configuration for deploying the full Airflow stack to AWS. All resources are tagged `Environment=ephemeral` for easy identification.
+
+### AWS Architecture
+
+| Component | AWS Service | Size |
+|-----------|-------------|------|
+| VPC | 2 public + 2 private subnets, NAT gateway | 10.0.0.0/16 |
+| Database | RDS PostgreSQL 15 | db.t4g.micro (20 GB gp3) |
+| Cache | ElastiCache Redis 7 | cache.t4g.micro |
+| Compute | ECS Fargate (5 services) | See below |
+| Storage | EFS (data + logs) | Bursting throughput |
+| Load Balancer | ALB on port 8080 | — |
+| Container Registry | ECR | Keep last 5 images |
+| Secrets | Secrets Manager | DB credentials (auto-generated) |
+| Logs | CloudWatch | 7-day retention |
+
+### ECS Services
+
+| Service | CPU | Memory | Notes |
+|---------|-----|--------|-------|
+| api-server | 512 | 1024 | Behind ALB, health-checked |
+| scheduler | 256 | 512 | |
+| dag-processor | 256 | 512 | |
+| worker | 1024 | 2048 | Celery executor |
+| triggerer | 256 | 512 | |
+| init (one-shot) | 512 | 1024 | Creates sec_data DB + airflow db migrate |
+
+### Deploying to AWS
+
+```bash
+# 1. Configure variables
+cd infra
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars — set allowed_cidr to your IP/32
+
+# 2. Full deploy (init → build → push → start services)
+./scripts/aws/deploy.sh
+
+# 3. Or step-by-step:
+cd infra && terraform init && terraform apply
+./scripts/aws/build_and_push.sh    # Build image, push to ECR
+./scripts/aws/deploy.sh --skip-build  # Run init + redeploy services
+```
+
+### Tearing Down
+
+```bash
+./scripts/aws/teardown.sh --yes
+```
+
+### Terraform State
+
+State is stored locally in `infra/terraform.tfstate` (gitignored). For team use, configure an S3 backend in `main.tf`.
+
+### Security Notes
+
+- **No hardcoded secrets**: DB password is generated via `random_password` at apply time.
+- **ALB access**: Restricted by `allowed_cidr` variable (default: `0.0.0.0/0` — set to your IP).
+- **Private subnets**: RDS, Redis, EFS, and ECS tasks are in private subnets; only the ALB is public.
+- **IAM least-privilege**: Execution role has ECR pull + Secrets Manager read; task role has EFS mount only.
+- **Never commit**: `infra/terraform.tfstate`, `infra/.terraform/`, or `infra/terraform.tfvars` (all gitignored).
 
 ## Notes for Changes
 

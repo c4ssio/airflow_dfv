@@ -19,7 +19,24 @@ except Exception:  # pragma: no cover
 
 
 def get_postgres_config(config_path: str) -> Dict[str, Any]:
-    """Load PostgreSQL configuration from YAML file."""
+    """Load PostgreSQL configuration from env vars (preferred) or YAML file.
+
+    When POSTGRES_HOST is set (e.g. via AWS Secrets Manager), env vars take
+    precedence and the YAML file is not required.
+    """
+    # Env-var path: AWS Secrets Manager / ECS task env
+    host = os.environ.get("POSTGRES_HOST", "").strip()
+    if host:
+        return {
+            "host": host,
+            "port": int(os.environ.get("POSTGRES_PORT", "5432")),
+            "database": os.environ.get("POSTGRES_DB", "sec_data"),
+            "user": os.environ.get("POSTGRES_USER", "airflow"),
+            "password": os.environ.get("POSTGRES_PASSWORD", "airflow"),
+            "schema": os.environ.get("POSTGRES_SCHEMA", "sec_raw"),
+        }
+
+    # YAML-file path: local Docker Compose setup
     if not yaml:
         raise RuntimeError(
             "pyyaml is required for PostgreSQL ingestion. Install with: pip install pyyaml"

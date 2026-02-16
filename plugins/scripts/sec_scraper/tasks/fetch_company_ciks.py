@@ -28,8 +28,12 @@ def fetch_company_ciks(cfg: Settings, session: requests.Session, tickers_url: st
         rows = [r for r in rows if int(r["cik"]) >= int(cfg.start_cik)]
 
     logger.info("Found %d total companies in SEC tickers file", len(rows))
-    logger.info("max_ciks limit: %d", cfg.max_ciks)
-    result = rows[: cfg.max_ciks]
-    logger.info("Returning %d companies (limited by max_ciks)", len(result))
+    if cfg.max_ciks <= 0:
+        logger.info("max_ciks=0 → returning all %d companies", len(rows))
+        result = rows
+    else:
+        logger.info("max_ciks limit: %d", cfg.max_ciks)
+        result = rows[: cfg.max_ciks]
+    logger.info("Returning %d companies", len(result))
     return result
 

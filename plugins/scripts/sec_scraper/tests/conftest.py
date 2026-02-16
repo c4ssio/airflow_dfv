@@ -38,4 +38,31 @@ _ensure_stub("airflow.operators.python", {"get_current_context": lambda: {}})
 _ensure_stub("yfinance", {"Ticker": MagicMock})
 
 # --- psycopg2 stub (only needed if not installed) ---
-_ensure_stub("psycopg2")
+
+class _FakeSQLIdentifier:
+    def __init__(self, val: str = ""):
+        self._val = val
+    def format(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return self
+    def __str__(self) -> str:
+        return self._val
+
+_psycopg2_extensions_stub = types.ModuleType("psycopg2.extensions")
+_psycopg2_extensions_stub.connection = type("connection", (), {})  # type: ignore[attr-defined]
+
+_psycopg2_sql_stub = types.ModuleType("psycopg2.sql")
+_psycopg2_sql_stub.SQL = staticmethod(lambda s: _FakeSQLIdentifier(s))  # type: ignore[attr-defined]
+_psycopg2_sql_stub.Identifier = staticmethod(lambda s: _FakeSQLIdentifier(s))  # type: ignore[attr-defined]
+
+_ensure_stub("psycopg2", {
+    "connect": MagicMock,
+    "extensions": _psycopg2_extensions_stub,
+    "sql": _psycopg2_sql_stub,
+})
+_ensure_stub("psycopg2.extensions", {
+    "connection": type("connection", (), {}),
+})
+_ensure_stub("psycopg2.sql", {
+    "SQL": _psycopg2_sql_stub.SQL,
+    "Identifier": _psycopg2_sql_stub.Identifier,
+})
