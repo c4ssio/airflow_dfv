@@ -2,7 +2,8 @@
 
 This repo contains an Airflow (CeleryExecutor) pipeline that downloads SEC EDGAR
 company data, ingests it into PostgreSQL, fetches daily ticker prices (Yahoo Finance),
-and validates the load. The primary entry point is the DAG in `dags/sec_scraper.py`.
+computes Berkshire-style valuation scores, and validates the load. The primary entry
+point is the DAG in `dags/sec_scraper.py`.
 
 **Stack:** Python 3.11, Apache Airflow 3.1.5 (CeleryExecutor), PostgreSQL 15, Redis 7.
 
@@ -21,23 +22,30 @@ airflow_dfv/
 │   │   ├── fetch_and_store_companies.py
 │   │   ├── ingest_to_postgres.py
 │   │   ├── validate_postgres_ingestion.py
-│   │   └── fetch_ticker_prices.py
+│   │   ├── fetch_ticker_prices.py
+│   │   └── company_valuation_score.py  # Berkshire-style cheapness/quality scoring
 │   ├── postgres/
 │   │   ├── helpers.py              # Connection, NDJSON loading, upsert helpers
 │   │   ├── deploy_migrations.py    # Migration runner (--dry-run, --verbose, --rollback)
+│   │   ├── init_databases.py       # Creates sec_data DB + runs migrations (used by ECS init)
+│   │   ├── run_log.py              # Pipeline run tracking (record_completed_run, get_last_successful_run_date)
 │   │   ├── migrations/             # SQL DDL files (YYYYMMDDHHMM__description.sql)
 │   │   └── README.md
 │   └── tests/
-│       ├── conftest.py                 # Stubs for airflow/yfinance/psycopg2 (host testing)
-│       ├── test_common.py              # load_settings, make_session, rate_limit, get_json
-│       ├── test_common_converters.py   # pad_cik, validators, NDJSON converters
-│       ├── test_fetch_company_ciks.py  # fetch_company_ciks
-│       ├── test_fetch_and_store_companies.py  # process_single_company, estimate_results_size_mb
-│       ├── test_fetch_ticker_prices.py # PriceBar, _to_float/int, Stooq CSV parsing
-│       ├── test_ingest_to_postgres.py  # _discover_cik_dirs, _build_ndjson_for_cik, ingest_ciks
-│       ├── test_postgres_helpers.py    # get_postgres_config, write_ndjson_file
-│       ├── test_storage.py             # s3_key, write_bytes, metadata, find_existing_data
-│       └── test_validate_postgres_ingestion.py  # All 5 validation scenarios
+│       ├── conftest.py                         # Stubs for airflow/yfinance/psycopg2 (host testing)
+│       ├── test_common.py                      # load_settings, make_session, rate_limit, get_json
+│       ├── test_common_converters.py           # pad_cik, validators, NDJSON converters
+│       ├── test_fetch_company_ciks.py          # fetch_company_ciks
+│       ├── test_fetch_and_store_companies.py   # process_single_company, estimate_results_size_mb
+│       ├── test_fetch_ticker_prices.py         # PriceBar, _to_float/int, Stooq CSV parsing
+│       ├── test_ingest_to_postgres.py          # _discover_cik_dirs, _build_ndjson_for_cik, ingest_ciks
+│       ├── test_postgres_helpers.py            # get_postgres_config, write_ndjson_file
+│       ├── test_storage.py                     # s3_key, write_bytes, metadata, find_existing_data
+│       ├── test_validate_postgres_ingestion.py # All 5 validation scenarios
+│       ├── test_company_valuation_score.py     # Valuation score computation
+│       ├── test_integration_valuation_score.py # Integration test with ephemeral Postgres
+│       ├── test_deploy_migrations.py           # Migration runner
+│       └── test_run_log.py                     # Pipeline run log recording
 ├── infra/                          # Terraform IaC for AWS deployment
 │   ├── main.tf                     # Provider config (AWS ~> 5.0, random ~> 3.0)
 │   ├── variables.tf                # Input variables (region, instance sizes, CIDR, etc.)
@@ -89,17 +97,21 @@ airflow_dfv/
    - Write `metadata.json` per CIK to support incremental updates.
 3. Convert JSON to NDJSON and load into PostgreSQL `sec_raw` tables (submissions, companyfacts_metadata, companyfacts_facts, metric_metadata). Ingestion skips CIKs already present for the current ingest date (idempotent).
 4. Run data integrity validations (row counts, NULL checks, PK uniqueness, type checks, array alignment).
-5. Fetch daily ticker prices for tracked tickers (from `submissions_ticker_mapping`) via Yahoo Finance (yfinance) and upsert into `sec_raw.ticker_prices_daily`.
+5. Fetch daily ticker prices for tracked tickers (from `submissions_ticker_mapping`) via Yahoo Finance (yfinance) and upsert into `sec_raw.ticker_prices_daily`. Supports backfill mode — queries DB for most recent price_date and fills the gap through today.
+6. Compute Berkshire-style valuation scores combining cheapness (55%) and quality (45%) factors. Each factor scored 0-100, combined into a composite grade (A-F). Stored in `sec_raw.company_valuation_scores`.
+7. Record successful run in `pipeline_run_log` for backfill tracking.
 
 ## DAG Task Sequence
 
 ```
-get_company_ciks → fetch_and_store_companies → ingest_to_postgres → validate_postgres_ingestion → fetch_ticker_prices → summarize
+get_company_ciks → fetch_and_store_companies → ingest_to_postgres → validate_postgres_ingestion → fetch_ticker_prices → score_company_valuations → summarize
 ```
 
-- **Schedule:** `0 6 * * *` (daily at 06:00), `catchup=False`, `max_active_runs=1`.
+- **Schedule:** `None` (trigger-only; was previously `0 6 * * *`).
 - **Default retries:** 2 with 2-minute delay.
-- `fetch_ticker_prices` uses the Airflow logical date (`ds`) so backfills pull historical prices.
+- `fetch_ticker_prices` uses backfill mode: queries DB for last price_date and fills through today (or the Airflow logical date `ds`).
+- `score_company_valuations` uses the Airflow logical date (`ds`) for the score date.
+- `summarize` records the completed run to `pipeline_run_log`.
 
 ## Database Schema (sec_raw)
 
@@ -113,6 +125,8 @@ get_company_ciks → fetch_and_store_companies → ingest_to_postgres → valida
 | `companyfacts_facts` | (cik, ingest_date, taxonomy, metric_name, unit, period_end, accession_number) | Normalized financial metrics (no label/description columns) |
 | `metric_metadata` | (taxonomy, metric_name) | Canonical metric reference; labels and descriptions live here |
 | `ticker_prices_daily` | (ticker, price_date) | Daily OHLCV; source e.g. "yahoo" |
+| `company_valuation_scores` | (cik, ticker, score_date) | Berkshire-style valuation scores — market data, fundamentals, ratios, component scores, composite grade |
+| `pipeline_run_log` | (run_id) | Tracks DAG runs with start/end times, status, and summary JSONB |
 | `schema_migrations` | (migration_name) | Migration tracking with MD5 checksums |
 
 ### Views
@@ -136,8 +150,8 @@ get_company_ciks → fetch_and_store_companies → ingest_to_postgres → valida
 | `SEC_S3_PREFIX` | No | `sec_raw` | S3 key prefix |
 | `SEC_INGEST_TEST_CIK` | No | `""` | Test with a single CIK |
 | `SEC_INGEST_MAX_CIKS` | No | `0` | Limit CIKs during ingestion (0 = no limit) |
-| `SEC_PRICE_DATE` | No | today | Override price fetch date |
-| `SEC_MAX_TICKERS_PER_RUN` | No | unlimited | Limit tickers for price fetch |
+| `SEC_PRICE_DATE` | No | today | Override price fetch date (also used as valuation score date) |
+| `SEC_MAX_TICKERS_PER_RUN` | No | `max_ciks` | Limit tickers for price fetch |
 | `POSTGRES_CONFIG_PATH` | No | auto-detected | Path to `postgres.yaml` (local only) |
 | `POSTGRES_HOST` | No | — | RDS host; when set, env vars override `postgres.yaml` |
 | `POSTGRES_PORT` | No | `5432` | Database port (used when `POSTGRES_HOST` is set) |
@@ -187,30 +201,6 @@ docker compose exec airflow-worker python /opt/airflow/plugins/scripts/sec_scrap
 
 # From host with venv
 ./scripts/run_with_venv.sh python plugins/scripts/sec_scraper/postgres/deploy_migrations.py
-
-# On ECS Fargate — run as a one-off task (recommended, captures logs in CloudWatch)
-aws ecs run-task --cluster sec-scraper-cluster \
-  --task-definition sec-scraper-worker --launch-type FARGATE \
-  --network-configuration '{
-    "awsvpcConfiguration": {
-      "subnets": ["<private-subnet-1>", "<private-subnet-2>"],
-      "securityGroups": ["<ecs-sg>"],
-      "assignPublicIp": "DISABLED"
-    }
-  }' \
-  --overrides '{
-    "containerOverrides": [{
-      "name": "worker",
-      "command": ["python", "/opt/airflow/plugins/scripts/sec_scraper/postgres/deploy_migrations.py", "--verbose"]
-    }]
-  }'
-# Then check CloudWatch logs at /ecs/sec-scraper, stream prefix worker/worker/<task-id>
-
-# On ECS Fargate — interactive (requires SSM Session Manager plugin installed locally)
-TASK_ID=$(aws ecs list-tasks --cluster sec-scraper-cluster --service-name sec-scraper-worker --query 'taskArns[0]' --output text)
-aws ecs execute-command --cluster sec-scraper-cluster --task "$TASK_ID" \
-  --container worker --interactive \
-  --command "python /opt/airflow/plugins/scripts/sec_scraper/postgres/deploy_migrations.py"
 ```
 
 ### Migration File Format
@@ -241,6 +231,7 @@ docker compose exec airflow-worker python -m pytest /opt/airflow/plugins/scripts
 - **Host-side stubs**: `conftest.py` provides lightweight stubs for `airflow`, `yfinance`, and `psycopg2` so tests run on the host without the full Docker stack. Stubs are only registered when the real module is not installed.
 - **DB-dependent functions**: Test via their callers using dependency injection and mock connections (e.g., `_FakeLoadFns` in `test_ingest_to_postgres.py`, `_FakeCursor`/`_FakeConn` in `test_validate_postgres_ingestion.py`).
 - **New task tests**: When adding a new task module, add a corresponding `test_<module>.py` file. Use the `_make_settings()` helper pattern (see any existing test file) to create `Settings` instances with sensible defaults.
+- **Integration tests**: `test_integration_valuation_score.py` tests against an ephemeral Postgres instance. These require a running database and are skipped when Postgres is unavailable.
 
 ### Type Checking
 
@@ -252,7 +243,7 @@ Pyright is configured in `pyrightconfig.json` (basic mode, Python 3.11). Include
 - **Keep DAG files thin**: Extract business logic to `plugins/scripts/sec_scraper/` modules. DAG files should contain only task wrappers and orchestration.
 - **Testability**: Functions should accept dependencies as parameters (dependency injection) rather than importing them directly, making them easier to unit test.
 - **Import convention**: In the DAG file, import task functions inside the `@task` wrapper to avoid import-time side effects. Module-level imports are fine for `common.py` utilities.
-- **Settings**: All configuration flows through the `Settings` dataclass in `common.py`. Never read `os.environ` directly in task modules—use `Settings` fields instead.
+- **Settings**: All configuration flows through the `Settings` dataclass in `common.py`. Never read `os.environ` directly in task modules—use `Settings` fields instead. (Exception: `SEC_PRICE_DATE` and `SEC_MAX_TICKERS_PER_RUN` are read directly in `fetch_ticker_prices` and `company_valuation_score` because they are task-level overrides not in the Settings dataclass.)
 - **CIK format**: CIKs are zero-padded to 10 digits via `pad_cik()` before storage or database operations.
 
 ## Docker Architecture
@@ -276,7 +267,7 @@ Volumes mount `dags/`, `plugins/`, `data/`, `config/`, and `logs/` into containe
 
 The Dockerfile `COPY`s `dags/` and `plugins/` into the image so ECS Fargate containers have application code baked in. In local development, Docker Compose volume mounts shadow these baked-in paths, so edits are reflected immediately without rebuilding. When deploying to ECS, run `build_and_push.sh` to rebuild the image with the latest code.
 
-The `sec_data` database is auto-created via `scripts/init-sec-db.sql` (mounted into Postgres `docker-entrypoint-initdb.d`).
+The `sec_data` database is auto-created via `scripts/init-sec-db.sql` (mounted into Postgres `docker-entrypoint-initdb.d`) locally, and via `init_databases.py` on ECS.
 
 ## AWS Deployment (ECS Fargate)
 
@@ -319,10 +310,6 @@ All ECS resources are prefixed with the project name (`sec-scraper` by default):
 | worker | 1024 | 2048 | Celery executor, `execute-command` enabled |
 | triggerer | 256 | 512 | |
 | init (one-shot) | 512 | 1024 | Creates sec_data DB + airflow db migrate |
-
-### ECS Postgres Configuration
-
-On ECS, database credentials are passed as environment variables (`POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_SCHEMA`) directly in the task definitions. The `get_postgres_config()` function in `helpers.py` checks for `POSTGRES_HOST` first and uses env vars when set, falling back to `postgres.yaml` only for local Docker Compose.
 
 ### Deploying to AWS
 
@@ -368,16 +355,6 @@ The ECS deployment uses Airflow 3's **Simple Auth Manager** for UI/API authentic
 - **Retrieve password:** `cd infra && terraform output -raw airflow_admin_password`
 - **ALB URL:** Available via `terraform output alb_url` (format: `http://<alb-dns>:8080`)
 
-### How It Works
-
-The api-server container uses an entrypoint wrapper that writes the password file before starting Airflow:
-```
-echo '{"admin": "$AIRFLOW_ADMIN_PASSWORD"}' > /opt/airflow/simple_auth_manager_passwords.json.generated
-exec airflow api-server
-```
-
-The `AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS` env var (set to `admin:admin`) defines the user and role. The `AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE` env var points to the generated file. Only the api-server needs this — other services don't serve the UI.
-
 ### API Authentication (Airflow 3.x)
 
 Airflow 3.x does **not** use basic auth for API calls. To authenticate programmatically:
@@ -401,15 +378,11 @@ curl http://<alb-url>:8080/api/v2/monitor/health
 
 ## Jumpbox
 
-A t3.micro EC2 instance in a public subnet for admin tasks (terraform, ECS exec, database access). Managed in `infra/jumpbox.tf`. Uses an **Elastic IP** so the address persists across stop/start cycles — no need to update security groups or SSH configs when restarting.
+A t3.micro EC2 instance in a public subnet for admin tasks (terraform, ECS exec, database access). Managed in `infra/jumpbox.tf`. Uses an **Elastic IP** so the address persists across stop/start cycles.
 
 ### What's Installed
 
-- Terraform
-- AWS CLI (via instance profile with AdministratorAccess)
-- Docker
-- SSM Session Manager plugin
-- Git
+- Terraform, AWS CLI (via instance profile with AdministratorAccess), Docker, SSM Session Manager plugin, Git
 
 ### Access
 
@@ -419,55 +392,6 @@ ssh -i ~/.ssh/remote_cursor_key ec2-user@$(cd infra && terraform output -raw jum
 
 # SSM Session Manager (no SSH key needed, requires AWS CLI locally)
 aws ssm start-session --target $(cd infra && terraform output -raw jumpbox_instance_id)
-```
-
-### Running Terraform from the Jumpbox
-
-```bash
-ssh ec2-user@<jumpbox-ip>
-cd ~/projects/airflow_dfv/infra
-terraform init
-terraform apply
-```
-
-### Triggering DAG Runs from the Jumpbox
-
-```bash
-# Via Airflow CLI (one-off ECS task)
-aws ecs run-task --cluster sec-scraper-cluster \
-  --task-definition sec-scraper-worker --launch-type FARGATE \
-  --network-configuration '{
-    "awsvpcConfiguration": {
-      "subnets": ["<private-subnet-1>", "<private-subnet-2>"],
-      "securityGroups": ["<ecs-sg>"],
-      "assignPublicIp": "DISABLED"
-    }
-  }' \
-  --overrides '{
-    "containerOverrides": [{
-      "name": "worker",
-      "command": ["bash", "-c", "airflow dags unpause sec_scraper && airflow dags trigger sec_scraper"]
-    }]
-  }'
-
-# Via ECS exec (interactive, on running worker)
-TASK_ID=$(aws ecs list-tasks --cluster sec-scraper-cluster \
-  --service-name sec-scraper-worker --query 'taskArns[0]' --output text)
-aws ecs execute-command --cluster sec-scraper-cluster --task "$TASK_ID" \
-  --container worker --interactive --command bash
-```
-
-### Redeploying Services from the Jumpbox
-
-```bash
-# After code changes — rebuild image and push
-cd ~/projects/airflow_dfv
-./scripts/aws/build_and_push.sh
-
-# Force ECS to pull the new image
-aws ecs update-service --cluster sec-scraper-cluster \
-  --service sec-scraper-worker --force-new-deployment
-# Repeat for other services as needed
 ```
 
 ## Operational Notes for Claude Code Sessions
@@ -498,6 +422,49 @@ aws logs get-log-events --log-group-name /ecs/sec-scraper \
   --query 'events[].message' --output text
 ```
 
+### Triggering a DAG Run from Claude Code
+
+Use the Airflow REST API via the ALB (no SSM needed):
+
+```bash
+# 1. Get JWT token
+TOKEN=$(curl -s -X POST http://<alb-url>:8080/auth/token \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"<password>"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+# 2. Unpause the DAG (required — DAGs are paused at creation on ECS)
+curl -s -X PATCH "http://<alb-url>:8080/api/v2/dags/sec_scraper" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"is_paused": false}'
+
+# 3. Trigger the DAG
+curl -s -X POST "http://<alb-url>:8080/api/v2/dags/sec_scraper/dagRuns" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# 4. Monitor progress
+curl -s "http://<alb-url>:8080/api/v2/dags/sec_scraper/dagRuns" \
+  -H "Authorization: Bearer $TOKEN" | python3 -c "
+import sys, json
+runs = json.load(sys.stdin).get('dag_runs', [])
+for r in runs[:3]:
+    print(f'{r[\"dag_run_id\"]}: {r[\"state\"]}')"
+```
+
+### Monitoring a DAG Run via API
+
+```bash
+# List task instances for a run
+curl -s "http://<alb-url>:8080/api/v2/dags/sec_scraper/dagRuns/<run_id>/taskInstances" \
+  -H "Authorization: Bearer $TOKEN" | python3 -c "
+import sys, json
+tasks = json.load(sys.stdin).get('task_instances', [])
+for t in tasks:
+    print(f'{t[\"task_id\"]}: {t[\"state\"]}')"
+```
+
 ### Updating ECS Task Definitions Without Terraform
 
 When you need to update a running service's config without terraform (e.g., adding env vars):
@@ -523,12 +490,13 @@ When you need to update a running service's config without terraform (e.g., addi
 | ALB DNS | `sec-scraper-alb-2104629405.us-east-1.elb.amazonaws.com` |
 | CloudWatch log group | `/ecs/sec-scraper` |
 
-### Airflow 3.x CLI Differences
+### Airflow 3.x Gotchas
 
-- `airflow dags list-runs` syntax changed from Airflow 2. Use `airflow dags list-runs <dag_id>` (no `-d` flag).
-- Health endpoint moved to `/api/v2/monitor/health` (not `/health`).
+- `airflow dags list-runs` syntax: `airflow dags list-runs <dag_id>` (no `-d` flag).
+- Health endpoint: `/api/v2/monitor/health` (not `/health`).
 - API uses JWT tokens via `/auth/token`, not basic auth.
 - DAGs are paused at creation on ECS (`AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=true`). Always `unpause` before triggering.
+- **CloudWatch remote logging is broken**: Airflow 3.x has a known issue with the `apache-airflow-providers-amazon` CloudWatch task handler ([GH#52501](https://github.com/apache/airflow/issues/52501)). Do NOT set `AIRFLOW__LOGGING__REMOTE_LOGGING=True` with CloudWatch — it crashes all services.
 
 ### Airflow 3.x ECS-Critical Configuration
 
@@ -537,21 +505,15 @@ These env vars are **required** for Airflow 3.x CeleryExecutor on ECS Fargate. W
 | Variable | Purpose |
 |----------|---------|
 | `AIRFLOW__CORE__EXECUTION_API_SERVER_URL` | URL workers use to reach the API server's Execution API (e.g., `http://<ALB>:8080/execution/`). Without this, workers can't communicate with the API server. |
-| `AIRFLOW__API_AUTH__JWT_SECRET` | **Must be identical across ALL services.** JWT signing key for internal Execution API auth. If each container generates its own, signature verification fails ([GH#59373](https://github.com/apache/airflow/issues/59373)). |
+| `AIRFLOW__API_AUTH__JWT_SECRET` | **Must be identical across ALL services.** JWT signing key for internal Execution API auth. If each container generates its own, signature verification fails. |
 | `AIRFLOW__CORE__FERNET_KEY` | Shared encryption key for Airflow connections/variables. Must be identical across all services. |
-| `AIRFLOW__CELERY__OPERATION_TIMEOUT` | Default is 1s — too short for Fargate cold starts. Set to `10.0` to prevent a redis import race condition ([GH#41359](https://github.com/apache/airflow/issues/41359)). |
+| `AIRFLOW__CELERY__OPERATION_TIMEOUT` | Default is 1s — too short for Fargate cold starts. Set to `10.0` to prevent a redis import race condition. |
 
 The scheduler uses a custom entrypoint that pre-imports `redis.client` before starting, preventing the race condition where Celery's operation timeout interrupts the redis module import.
 
 ### Secrets Management
 
-Sensitive values (Fernet key, JWT secret, DB passwords, admin password) are stored in **AWS Secrets Manager** at `sec-scraper/app-config`. The Terraform config also generates these via `random_password` resources. On ECS, values are passed directly as environment variables in task definitions (not pulled at runtime from Secrets Manager — they're baked in at `register-task-definition` time).
-
-### Task Log Visibility
-
-- **EFS logs** (`/opt/airflow/logs`): Mounted on all services. Task execution logs are written here when tasks actually execute on the worker.
-- **CloudWatch container logs** (`/ecs/sec-scraper`): Service stdout/stderr. Useful for scheduler errors, worker startup issues, and Celery connection problems.
-- **CloudWatch remote logging**: Airflow 3.x has a known issue with the `apache-airflow-providers-amazon` CloudWatch task handler ([GH#52501](https://github.com/apache/airflow/issues/52501)). Do NOT set `AIRFLOW__LOGGING__REMOTE_LOGGING=True` with CloudWatch — it crashes all services.
+Sensitive values (Fernet key, JWT secret, DB passwords, admin password) are stored in **AWS Secrets Manager** at `sec-scraper/app-config`. The Terraform config generates these via `random_password` resources. On ECS, values are passed directly as environment variables in task definitions (not pulled at runtime from Secrets Manager — they're baked in at `register-task-definition` time).
 
 ## On-Demand Stack (Cost Management)
 
@@ -588,16 +550,6 @@ The stack can be stopped and started on demand to save costs when not in use.
 
 The start script waits for RDS to become available before scaling up ECS services. Full startup takes ~5 minutes.
 
-### Full Teardown (Destroy Everything)
-
-To completely destroy all resources (irreversible):
-
-```bash
-./scripts/aws/teardown.sh --yes
-```
-
-This runs `terraform destroy` and removes all AWS resources including data.
-
 ## Notes for Changes
 
 - **Secrets**: Do not commit `config/secrets.env` or `config/postgres.yaml`. The entire `config/` directory is gitignored except `*.example` files.
@@ -605,3 +557,20 @@ This runs `terraform destroy` and removes all AWS resources including data.
 - **Schema changes**: If you change PostgreSQL schemas, add a new migration SQL file and update any NDJSON conversion logic in `common.py` or `ingest_to_postgres.py`.
 - **New tasks**: Create the task module in `plugins/scripts/sec_scraper/tasks/`, then add a thin `@task` wrapper in the DAG file.
 - **Diagnostics output**: Scripts that produce diagnostic output write to `diagnostics/` (also gitignored).
+
+## DAG Run Performance (Observed)
+
+Typical timings for a full DAG run processing 250 CIKs on ECS (worker: 1024 CPU / 2048 MiB):
+
+| Task | Duration |
+|------|----------|
+| `get_company_ciks` | ~10s |
+| `fetch_and_store_companies` | ~5-8 min |
+| `ingest_to_postgres` | ~25-30 min |
+| `validate_postgres_ingestion` | ~10s |
+| `fetch_ticker_prices` | ~2-3 min |
+| `score_company_valuations` | ~1-2 min |
+| `summarize` | ~5s |
+| **Total** | **~35-45 min** |
+
+`ingest_to_postgres` is the bottleneck — it converts raw JSON to NDJSON and bulk-loads into Postgres for each CIK sequentially.
