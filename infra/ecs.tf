@@ -11,10 +11,12 @@ locals {
     { name = "AIRFLOW__CORE__EXECUTOR", value = "CeleryExecutor" },
     { name = "AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION", value = "true" },
     { name = "AIRFLOW__CORE__LOAD_EXAMPLES", value = "false" },
+    { name = "AIRFLOW__CORE__EXECUTION_API_SERVER_URL", value = "http://${aws_lb.main.dns_name}:8080/execution/" },
     { name = "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", value = "postgresql+psycopg2://${local.rds_user}:${local.rds_password}@${local.rds_host}:${local.rds_port}/airflow" },
     { name = "AIRFLOW__CELERY__BROKER_URL", value = "redis://${local.redis_host}:${local.redis_port}/0" },
     { name = "AIRFLOW__CELERY__RESULT_BACKEND", value = "db+postgresql://${local.rds_user}:${local.rds_password}@${local.rds_host}:${local.rds_port}/airflow" },
     { name = "AIRFLOW__CELERY__WORKER_CONCURRENCY", value = "2" },
+    { name = "AIRFLOW__CELERY__OPERATION_TIMEOUT", value = "10.0" },
     { name = "AIRFLOW__API__HOST", value = "0.0.0.0" },
     { name = "AIRFLOW__API__PORT", value = "8080" },
     { name = "AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX", value = "True" },
@@ -32,6 +34,9 @@ locals {
     { name = "AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS", value = "admin:admin" },
     { name = "AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE", value = "/opt/airflow/simple_auth_manager_passwords.json.generated" },
     { name = "AIRFLOW_ADMIN_PASSWORD", value = random_password.airflow_admin.result },
+    { name = "AIRFLOW__CORE__FERNET_KEY", value = base64encode(random_password.fernet_key.result) },
+    { name = "AIRFLOW__CORE__INTERNAL_API_SECRET_KEY", value = random_password.internal_api_secret.result },
+    { name = "AIRFLOW__API_AUTH__JWT_SECRET", value = random_password.internal_api_secret.result },
   ]
 
   efs_volumes = [
@@ -216,7 +221,8 @@ resource "aws_ecs_task_definition" "scheduler" {
     name      = "scheduler"
     image     = local.image
     essential = true
-    command   = ["scheduler"]
+    entryPoint = ["/bin/bash", "-c"]
+    command    = ["python -c 'import redis.client' && exec airflow scheduler"]
 
     environment = local.airflow_env
 

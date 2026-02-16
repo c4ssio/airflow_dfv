@@ -530,6 +530,29 @@ When you need to update a running service's config without terraform (e.g., addi
 - API uses JWT tokens via `/auth/token`, not basic auth.
 - DAGs are paused at creation on ECS (`AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=true`). Always `unpause` before triggering.
 
+### Airflow 3.x ECS-Critical Configuration
+
+These env vars are **required** for Airflow 3.x CeleryExecutor on ECS Fargate. Without them, tasks will fail silently:
+
+| Variable | Purpose |
+|----------|---------|
+| `AIRFLOW__CORE__EXECUTION_API_SERVER_URL` | URL workers use to reach the API server's Execution API (e.g., `http://<ALB>:8080/execution/`). Without this, workers can't communicate with the API server. |
+| `AIRFLOW__API_AUTH__JWT_SECRET` | **Must be identical across ALL services.** JWT signing key for internal Execution API auth. If each container generates its own, signature verification fails ([GH#59373](https://github.com/apache/airflow/issues/59373)). |
+| `AIRFLOW__CORE__FERNET_KEY` | Shared encryption key for Airflow connections/variables. Must be identical across all services. |
+| `AIRFLOW__CELERY__OPERATION_TIMEOUT` | Default is 1s — too short for Fargate cold starts. Set to `10.0` to prevent a redis import race condition ([GH#41359](https://github.com/apache/airflow/issues/41359)). |
+
+The scheduler uses a custom entrypoint that pre-imports `redis.client` before starting, preventing the race condition where Celery's operation timeout interrupts the redis module import.
+
+### Secrets Management
+
+Sensitive values (Fernet key, JWT secret, DB passwords, admin password) are stored in **AWS Secrets Manager** at `sec-scraper/app-config`. The Terraform config also generates these via `random_password` resources. On ECS, values are passed directly as environment variables in task definitions (not pulled at runtime from Secrets Manager — they're baked in at `register-task-definition` time).
+
+### Task Log Visibility
+
+- **EFS logs** (`/opt/airflow/logs`): Mounted on all services. Task execution logs are written here when tasks actually execute on the worker.
+- **CloudWatch container logs** (`/ecs/sec-scraper`): Service stdout/stderr. Useful for scheduler errors, worker startup issues, and Celery connection problems.
+- **CloudWatch remote logging**: Airflow 3.x has a known issue with the `apache-airflow-providers-amazon` CloudWatch task handler ([GH#52501](https://github.com/apache/airflow/issues/52501)). Do NOT set `AIRFLOW__LOGGING__REMOTE_LOGGING=True` with CloudWatch — it crashes all services.
+
 ## On-Demand Stack (Cost Management)
 
 The stack can be stopped and started on demand to save costs when not in use.

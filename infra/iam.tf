@@ -67,6 +67,27 @@ resource "aws_iam_role_policy" "ecs_task_efs" {
   })
 }
 
+resource "aws_iam_role_policy" "ecs_task_logs" {
+  name = "${var.project_name}-ecs-task-logs"
+  role = aws_iam_role.ecs_task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams",
+        "logs:GetLogEvents"
+      ]
+      Resource = "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:/ecs/${var.project_name}*"
+    }]
+  })
+}
+
 resource "aws_iam_role_policy" "ecs_task_ssm" {
   name = "${var.project_name}-ecs-task-ssm"
   role = aws_iam_role.ecs_task.id
@@ -92,4 +113,11 @@ resource "aws_cloudwatch_log_group" "airflow" {
   retention_in_days = 7
 
   tags = { Name = "${var.project_name}-logs" }
+}
+
+resource "aws_cloudwatch_log_group" "task_logs" {
+  name              = "/ecs/${var.project_name}-task-logs"
+  retention_in_days = 7
+
+  tags = { Name = "${var.project_name}-task-logs" }
 }
