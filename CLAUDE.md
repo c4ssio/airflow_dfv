@@ -135,7 +135,13 @@ get_company_ciks → fetch_and_store_companies → ingest_to_postgres → valida
 | `SEC_INGEST_MAX_CIKS` | No | `0` | Limit CIKs during ingestion (0 = no limit) |
 | `SEC_PRICE_DATE` | No | today | Override price fetch date |
 | `SEC_MAX_TICKERS_PER_RUN` | No | unlimited | Limit tickers for price fetch |
-| `POSTGRES_CONFIG_PATH` | No | auto-detected | Path to `postgres.yaml` |
+| `POSTGRES_CONFIG_PATH` | No | auto-detected | Path to `postgres.yaml` (local only) |
+| `POSTGRES_HOST` | No | — | RDS host; when set, env vars override `postgres.yaml` |
+| `POSTGRES_PORT` | No | `5432` | Database port (used when `POSTGRES_HOST` is set) |
+| `POSTGRES_DB` | No | `sec_data` | Database name (used when `POSTGRES_HOST` is set) |
+| `POSTGRES_USER` | No | `airflow` | Database user (used when `POSTGRES_HOST` is set) |
+| `POSTGRES_PASSWORD` | No | `airflow` | Database password (used when `POSTGRES_HOST` is set) |
+| `POSTGRES_SCHEMA` | No | `sec_raw` | Database schema (used when `POSTGRES_HOST` is set) |
 
 ### Postgres Config (`config/postgres.yaml`, gitignored)
 
@@ -178,6 +184,30 @@ docker compose exec airflow-worker python /opt/airflow/plugins/scripts/sec_scrap
 
 # From host with venv
 ./scripts/run_with_venv.sh python plugins/scripts/sec_scraper/postgres/deploy_migrations.py
+
+# On ECS Fargate — run as a one-off task (recommended, captures logs in CloudWatch)
+aws ecs run-task --cluster sec-scraper-cluster \
+  --task-definition sec-scraper-worker --launch-type FARGATE \
+  --network-configuration '{
+    "awsvpcConfiguration": {
+      "subnets": ["<private-subnet-1>", "<private-subnet-2>"],
+      "securityGroups": ["<ecs-sg>"],
+      "assignPublicIp": "DISABLED"
+    }
+  }' \
+  --overrides '{
+    "containerOverrides": [{
+      "name": "worker",
+      "command": ["python", "/opt/airflow/plugins/scripts/sec_scraper/postgres/deploy_migrations.py", "--verbose"]
+    }]
+  }'
+# Then check CloudWatch logs at /ecs/sec-scraper, stream prefix worker/worker/<task-id>
+
+# On ECS Fargate — interactive (requires SSM Session Manager plugin installed locally)
+TASK_ID=$(aws ecs list-tasks --cluster sec-scraper-cluster --service-name sec-scraper-worker --query 'taskArns[0]' --output text)
+aws ecs execute-command --cluster sec-scraper-cluster --task "$TASK_ID" \
+  --container worker --interactive \
+  --command "python /opt/airflow/plugins/scripts/sec_scraper/postgres/deploy_migrations.py"
 ```
 
 ### Migration File Format
@@ -239,6 +269,10 @@ Services defined in `compose.yaml`:
 
 Volumes mount `dags/`, `plugins/`, `data/`, `config/`, and `logs/` into containers at `/opt/airflow/`.
 
+### Local vs ECS Code Strategy
+
+The Dockerfile `COPY`s `dags/` and `plugins/` into the image so ECS Fargate containers have application code baked in. In local development, Docker Compose volume mounts shadow these baked-in paths, so edits are reflected immediately without rebuilding. When deploying to ECS, run `build_and_push.sh` to rebuild the image with the latest code.
+
 The `sec_data` database is auto-created via `scripts/init-sec-db.sql` (mounted into Postgres `docker-entrypoint-initdb.d`).
 
 ## AWS Deployment (ECS Fargate)
@@ -259,6 +293,18 @@ The `infra/` directory contains Terraform configuration for deploying the full A
 | Secrets | Secrets Manager | DB credentials (auto-generated) |
 | Logs | CloudWatch | 7-day retention |
 
+### ECS Naming Conventions
+
+All ECS resources are prefixed with the project name (`sec-scraper` by default):
+
+| Resource | Name |
+|----------|------|
+| Cluster | `sec-scraper-cluster` |
+| Services | `sec-scraper-worker`, `sec-scraper-api-server`, `sec-scraper-scheduler`, etc. |
+| Containers | Named after their role: `worker`, `api-server`, `scheduler`, `dag-processor`, `triggerer`, `init` |
+| CloudWatch log group | `/ecs/sec-scraper` |
+| Log stream format | `<stream-prefix>/<container-name>/<task-id>` (e.g., `worker/worker/abc123`) |
+
 ### ECS Services
 
 | Service | CPU | Memory | Notes |
@@ -266,9 +312,13 @@ The `infra/` directory contains Terraform configuration for deploying the full A
 | api-server | 512 | 1024 | Behind ALB, health-checked |
 | scheduler | 256 | 512 | |
 | dag-processor | 256 | 512 | |
-| worker | 1024 | 2048 | Celery executor |
+| worker | 1024 | 2048 | Celery executor, `execute-command` enabled |
 | triggerer | 256 | 512 | |
 | init (one-shot) | 512 | 1024 | Creates sec_data DB + airflow db migrate |
+
+### ECS Postgres Configuration
+
+On ECS, database credentials are passed as environment variables (`POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_SCHEMA`) directly in the task definitions. The `get_postgres_config()` function in `helpers.py` checks for `POSTGRES_HOST` first and uses env vars when set, falling back to `postgres.yaml` only for local Docker Compose.
 
 ### Deploying to AWS
 
@@ -302,7 +352,7 @@ State is stored locally in `infra/terraform.tfstate` (gitignored). For team use,
 - **No hardcoded secrets**: DB password is generated via `random_password` at apply time.
 - **ALB access**: Restricted by `allowed_cidr` variable (default: `0.0.0.0/0` — set to your IP).
 - **Private subnets**: RDS, Redis, EFS, and ECS tasks are in private subnets; only the ALB is public.
-- **IAM least-privilege**: Execution role has ECR pull + Secrets Manager read; task role has EFS mount only.
+- **IAM least-privilege**: Execution role has ECR pull + Secrets Manager read; task role has EFS mount + SSM messages (for `execute-command`).
 - **Never commit**: `infra/terraform.tfstate`, `infra/.terraform/`, or `infra/terraform.tfvars` (all gitignored).
 
 ## Notes for Changes

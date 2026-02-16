@@ -23,7 +23,12 @@ locals {
     { name = "SEC_REQUESTS_PER_SECOND", value = "5" },
     { name = "SEC_TIMEOUT_SECONDS", value = "30" },
     { name = "SEC_LOCAL_DIR", value = "/opt/airflow/data/sec_raw" },
-    { name = "POSTGRES_CONFIG_PATH", value = "/opt/airflow/config/postgres.yaml" },
+    { name = "POSTGRES_HOST", value = local.rds_host },
+    { name = "POSTGRES_PORT", value = local.rds_port },
+    { name = "POSTGRES_DB", value = "sec_data" },
+    { name = "POSTGRES_USER", value = local.rds_user },
+    { name = "POSTGRES_PASSWORD", value = local.rds_password },
+    { name = "POSTGRES_SCHEMA", value = "sec_raw" },
   ]
 
   efs_volumes = [
@@ -364,6 +369,8 @@ resource "aws_ecs_service" "worker" {
   task_definition = aws_ecs_task_definition.worker.arn
   desired_count   = 1
   launch_type     = "FARGATE"
+
+  enable_execute_command = true
 
   network_configuration {
     subnets         = aws_subnet.private[*].id

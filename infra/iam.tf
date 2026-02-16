@@ -67,6 +67,25 @@ resource "aws_iam_role_policy" "ecs_task_efs" {
   })
 }
 
+resource "aws_iam_role_policy" "ecs_task_ssm" {
+  name = "${var.project_name}-ecs-task-ssm"
+  role = aws_iam_role.ecs_task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "ssmmessages:CreateControlChannel",
+        "ssmmessages:CreateDataChannel",
+        "ssmmessages:OpenControlChannel",
+        "ssmmessages:OpenDataChannel"
+      ]
+      Resource = "*"
+    }]
+  })
+}
+
 # --- CloudWatch Log Group ---
 resource "aws_cloudwatch_log_group" "airflow" {
   name              = "/ecs/${var.project_name}"
