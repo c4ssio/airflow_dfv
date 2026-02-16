@@ -178,6 +178,12 @@ docker compose exec airflow-worker python /opt/airflow/plugins/scripts/sec_scrap
 
 # From host with venv
 ./scripts/run_with_venv.sh python plugins/scripts/sec_scraper/postgres/deploy_migrations.py
+
+# On ECS Fargate (run against the worker container)
+TASK_ID=$(aws ecs list-tasks --cluster sec-scraper --service-name worker --query 'taskArns[0]' --output text)
+aws ecs execute-command --cluster sec-scraper --task "$TASK_ID" \
+  --container airflow --interactive \
+  --command "python /opt/airflow/plugins/scripts/sec_scraper/postgres/deploy_migrations.py"
 ```
 
 ### Migration File Format
@@ -238,6 +244,10 @@ Services defined in `compose.yaml`:
 | `airflow-triggerer` | Event-based triggers |
 
 Volumes mount `dags/`, `plugins/`, `data/`, `config/`, and `logs/` into containers at `/opt/airflow/`.
+
+### Local vs ECS Code Strategy
+
+The Dockerfile `COPY`s `dags/` and `plugins/` into the image so ECS Fargate containers have application code baked in. In local development, Docker Compose volume mounts shadow these baked-in paths, so edits are reflected immediately without rebuilding. When deploying to ECS, run `build_and_push.sh` to rebuild the image with the latest code.
 
 The `sec_data` database is auto-created via `scripts/init-sec-db.sql` (mounted into Postgres `docker-entrypoint-initdb.d`).
 
