@@ -289,3 +289,45 @@ def test_ingest_ciks_returns_zeros_when_no_dirs(tmp_path, monkeypatch):
     result = ingest_ciks(cfg, postgres_config, loader, upsert_metric_metadata_fn=MagicMock())
 
     assert result == {"total_ciks": 0, "processed": 0, "errors": 0, "skipped": 0}
+
+
+def test_ingest_ciks_force_ingest_overrides_skip_logic(tmp_path, monkeypatch):
+    """Test that force_ingest_ciks parameter allows re-ingestion of existing CIKs."""
+    # Set up CIK directory with submissions.json
+    cik_dir = tmp_path / "cik=100"
+    cik_dir.mkdir()
+    (cik_dir / "submissions.json").write_text(json.dumps({"name": "Corp"}))
+
+    cfg = _make_settings(local_dir=str(tmp_path))
+    postgres_config = {"schema": "sec_raw"}
+    loader = _FakeLoadFns()
+
+    # CIK 100 was previously ingested (any date)
+    monkeypatch.setattr(
+        "scripts.sec_scraper.tasks.ingest_to_postgres.get_ciks_already_ingested",
+        lambda conn, schema, date: set(),  # Not ingested TODAY
+    )
+    monkeypatch.setattr(
+        "scripts.sec_scraper.tasks.ingest_to_postgres.get_all_ingested_ciks",
+        lambda conn, schema: {"0000000100"},  # Previously ingested
+    )
+
+    # Without force_ingest_ciks, CIK should be skipped
+    result = ingest_ciks(cfg, postgres_config, loader, upsert_metric_metadata_fn=MagicMock())
+    assert result["skipped"] == 1
+    assert result["processed"] == 0
+
+    # Reset loader
+    loader.calls = []
+
+    # With force_ingest_ciks, CIK should be processed
+    result = ingest_ciks(
+        cfg,
+        postgres_config,
+        loader,
+        upsert_metric_metadata_fn=MagicMock(),
+        force_ingest_ciks={"0000000100"},
+    )
+    assert result["processed"] == 1
+    assert result["skipped"] == 0
+    assert len(loader.calls) > 0
