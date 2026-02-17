@@ -51,7 +51,7 @@ airflow_dfv/
 │   ├── variables.tf                # Input variables (region, instance sizes, CIDR, etc.)
 │   ├── outputs.tf                  # ALB URL, RDS/Redis endpoints, ECR repo URL
 │   ├── vpc.tf                      # VPC, 2 public + 2 private subnets, IGW, NAT, routes
-│   ├── security_groups.tf          # 6 SGs: ALB, ECS, RDS, Redis, EFS, Jumpbox
+│   ├── security_groups.tf          # 5 SGs: ALB, ECS, RDS, Redis, EFS
 │   ├── ecr.tf                      # ECR repository + lifecycle policy
 │   ├── rds.tf                      # RDS PostgreSQL 15 (db.t4g.micro), random passwords
 │   ├── elasticache.tf              # ElastiCache Redis 7 (cache.t4g.micro)
@@ -60,7 +60,6 @@ airflow_dfv/
 │   ├── iam.tf                      # Execution role + task role, CloudWatch log group
 │   ├── alb.tf                      # ALB on port 8080 with health checks
 │   ├── ecs.tf                      # ECS Fargate cluster, 6 task defs, 5 services
-│   ├── jumpbox.tf                  # Jumpbox EC2 in public subnet (terraform, ECS exec)
 │   └── terraform.tfvars.example    # Example variable values
 ├── scripts/
 │   ├── setup_venv.sh               # Create Python venv on the host
@@ -73,10 +72,12 @@ airflow_dfv/
 │   ├── init-sec-db.sql             # Creates sec_data DB on first Postgres startup
 │   ├── adhoc/                      # One-off diagnostics (SQL, Python)
 │   └── aws/                        # AWS deployment scripts
+│       ├── create_jumpbox.sh       # Create standalone jumpbox EC2 (AWS CLI only, no Terraform)
+│       ├── destroy_jumpbox.sh      # Destroy jumpbox EC2
 │       ├── build_and_push.sh       # Build Docker image and push to ECR
 │       ├── deploy.sh               # Full deploy: terraform apply → build → init → redeploy
 │       ├── teardown.sh             # Scale down ECS + terraform destroy
-│       ├── stop_stack.sh           # Stop stack to save costs (ECS→0, RDS stop, EC2 stop)
+│       ├── stop_stack.sh           # Stop stack to save costs (ECS→0, RDS stop)
 │       └── start_stack.sh          # Start stack back up (reverse of stop)
 ├── config/                         # gitignored — secrets.env, postgres.yaml
 ├── compose.yaml                    # Docker Compose (all services)
@@ -286,7 +287,6 @@ The `infra/` directory contains Terraform configuration for deploying the full A
 | Container Registry | ECR | Keep last 5 images |
 | Secrets | Secrets Manager | DB + Airflow admin credentials |
 | Logs | CloudWatch | 7-day retention |
-| Jumpbox | EC2 t3.micro in public subnet | SSH + SSM access |
 
 ### ECS Naming Conventions
 
@@ -313,25 +313,31 @@ All ECS resources are prefixed with the project name (`sec-scraper` by default):
 
 ### Deploying to AWS
 
+The jumpbox is managed separately from the main infrastructure (no circular Terraform dependency).
+
 ```bash
-# 1. Configure variables
-cd infra
+# 1. Create jumpbox (locally, needs only AWS CLI)
+./scripts/aws/create_jumpbox.sh
+
+# 2. SSH to jumpbox
+ssh -i ~/.ssh/sec-scraper-jumpbox-key.pem ec2-user@<ip-from-output>
+
+# 3. On the jumpbox: clone repo and deploy
+git clone <your-repo-url> ~/projects/airflow_dfv
+cd ~/projects/airflow_dfv/infra
 cp terraform.tfvars.example terraform.tfvars
 # Edit terraform.tfvars — set allowed_cidr to your IP/32
-
-# 2. Full deploy (init → build → push → start services)
-./scripts/aws/deploy.sh
-
-# 3. Or step-by-step:
-cd infra && terraform init && terraform apply
-./scripts/aws/build_and_push.sh    # Build image, push to ECR
-./scripts/aws/deploy.sh --skip-build  # Run init + redeploy services
+cd .. && ./scripts/aws/deploy.sh
 ```
 
 ### Tearing Down
 
 ```bash
+# 1. On the jumpbox: destroy Terraform resources
 ./scripts/aws/teardown.sh --yes
+
+# 2. Locally: destroy the jumpbox itself
+./scripts/aws/destroy_jumpbox.sh
 ```
 
 ### Terraform State
@@ -378,32 +384,59 @@ curl http://<alb-url>:8080/api/v2/monitor/health
 
 ## Jumpbox
 
-A t3.micro EC2 instance in a public subnet for admin tasks (terraform, ECS exec, database access). Managed in `infra/jumpbox.tf`. Uses an **Elastic IP** so the address persists across stop/start cycles.
+A t3.micro EC2 instance in the default VPC for running Terraform, Docker builds, and ECS exec. **Managed independently** via `scripts/aws/create_jumpbox.sh` (not Terraform), so there's no circular dependency.
 
 ### What's Installed
 
-- Terraform, AWS CLI (via instance profile with AdministratorAccess), Docker, SSM Session Manager plugin, Git
+- Terraform, Docker, Git, SSM Session Manager plugin
 
-### Access
+### Lifecycle
 
 ```bash
-# SSH (requires the remote_cursor_key private key)
-ssh -i ~/.ssh/remote_cursor_key ec2-user@$(cd infra && terraform output -raw jumpbox_public_ip)
+# Create (locally, needs only AWS CLI)
+./scripts/aws/create_jumpbox.sh
 
-# SSM Session Manager (no SSH key needed, requires AWS CLI locally)
-aws ssm start-session --target $(cd infra && terraform output -raw jumpbox_instance_id)
+# SSH in
+ssh -i ~/.ssh/sec-scraper-jumpbox-key.pem ec2-user@<ip>
+
+# Destroy (locally)
+./scripts/aws/destroy_jumpbox.sh
 ```
+
+State is saved to `~/.sec-scraper-jumpbox.json` so the destroy script knows what to clean up.
 
 ## Operational Notes for Claude Code Sessions
 
-### AWS Credentials
+### AWS CLI Setup
 
-When connecting to the AWS account from a Claude Code session (without jumpbox access):
+Install AWS CLI v2 and set credentials before doing anything AWS-related:
 
-- **AWS CLI is not pre-installed** — install with `pip install awscli`.
-- Set credentials via env vars: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION=us-east-1`.
-- **Cannot run `terraform apply`** — use the jumpbox for terraform operations.
-- **Cannot use `aws ecs execute-command`** — requires SSM Session Manager plugin (not available in Claude Code sandbox).
+```bash
+# Install AWS CLI v2 (required — v1 is missing features like --no-cli-pager)
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp && /tmp/aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli
+rm -rf /tmp/awscliv2.zip /tmp/aws
+
+# Set credentials (user will provide these)
+export AWS_ACCESS_KEY_ID=<key>
+export AWS_SECRET_ACCESS_KEY=<secret>
+export AWS_DEFAULT_REGION=us-east-1
+```
+
+### What Claude Code Sessions CAN vs CANNOT Do
+
+**Can do directly:**
+- Query AWS resources (`aws ecs list-clusters`, `aws rds describe-db-instances`, etc.)
+- Create/destroy the jumpbox (`create_jumpbox.sh` / `destroy_jumpbox.sh`)
+- Trigger DAG runs via the Airflow REST API
+- Update ECS task definitions and redeploy services
+- Delete individual resources for teardown
+- Run `aws ecs run-task` with command overrides
+
+**Requires the jumpbox (SSH in first):**
+- `terraform apply` / `terraform destroy`
+- `aws ecs execute-command` (requires SSM Session Manager plugin)
+- Building and pushing Docker images to ECR (requires Docker daemon)
 
 ### Running Airflow CLI Commands Remotely
 
@@ -477,18 +510,16 @@ When you need to update a running service's config without terraform (e.g., addi
 
 ### Key Resource IDs (Current Deployment)
 
-| Resource | Value |
-|----------|-------|
-| VPC | `vpc-068394bf0f50bb05b` |
-| Private subnets | `subnet-0b9d77ddeb71d38fc`, `subnet-0bc236aee1170c5f5` |
-| Public subnets | `subnet-048aef579a62e1f3b`, `subnet-0870391697fc216c4` |
-| ECS security group | `sg-04d71ebe55272f655` |
-| ALB security group | `sg-041181b4ade7d74f7` |
-| Jumpbox security group | `sg-02704825b173677e0` |
-| Jumpbox instance | `i-08608d20f790c623f` |
-| Jumpbox Elastic IP | `44.198.7.177` (`eipalloc-0f95920bc202f2538`) |
-| ALB DNS | `sec-scraper-alb-2104629405.us-east-1.elb.amazonaws.com` |
-| CloudWatch log group | `/ecs/sec-scraper` |
+**No active deployment.** All AWS resources were torn down on 2026-02-17. To redeploy, create a jumpbox (`create_jumpbox.sh`), SSH in, and run `deploy.sh`. After deploying, update this section with the new resource IDs by running:
+
+```bash
+# From the jumpbox (after deploy.sh)
+cd ~/projects/airflow_dfv/infra
+echo "VPC: $(terraform output -raw vpc_id)"
+echo "Private subnets: $(terraform output -json private_subnet_ids)"
+echo "Public subnets: $(terraform output -json public_subnet_ids)"
+echo "ALB DNS: $(terraform output -raw alb_url)"
+```
 
 ### Airflow 3.x Gotchas
 
@@ -522,14 +553,13 @@ The stack can be stopped and started on demand to save costs when not in use.
 ### Stop the Stack
 
 ```bash
-./scripts/aws/stop_stack.sh            # Stop ECS, RDS, jumpbox
+./scripts/aws/stop_stack.sh            # Stop ECS, RDS
 ./scripts/aws/stop_stack.sh --delete-redis  # Also delete Redis (saves ~$12/mo)
 ```
 
 **What gets stopped (free when stopped):**
 - ECS Fargate services → scaled to 0
 - RDS PostgreSQL → stopped (note: AWS auto-restarts after 7 days)
-- Jumpbox EC2 → stopped (Elastic IP retained, same IP on restart)
 
 **What keeps running (baseline cost when stopped):**
 
@@ -538,8 +568,8 @@ The stack can be stopped and started on demand to save costs when not in use.
 | NAT Gateway | ~$32 | Required for private subnet internet |
 | ALB | ~$16 | Keeps DNS stable |
 | ElastiCache Redis | ~$12 | Cannot be stopped; use `--delete-redis` to remove |
-| EIP | $0 | Free when attached (even to stopped instance) |
 | EFS | ~$0.30/GB | Minimal unless storing lots of data |
+| Jumpbox | ~$8 | Standalone EC2; destroy separately with `destroy_jumpbox.sh` |
 
 ### Start the Stack
 

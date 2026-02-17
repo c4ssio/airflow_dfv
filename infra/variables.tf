@@ -93,9 +93,3 @@ variable "triggerer_memory" {
   type    = number
   default = 512
 }
-
-variable "jumpbox_key_name" {
-  description = "EC2 key pair name for the jumpbox"
-  type        = string
-  default     = "remote_cursor_key"
-}
