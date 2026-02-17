@@ -520,7 +520,13 @@ When you need to update a running service's config without terraform (e.g., addi
 
 ### Key Resource IDs (Current Deployment)
 
-**No active deployment.** All AWS resources were torn down on 2026-02-17. To redeploy, create a jumpbox (`create_jumpbox.sh`), SSH in, and run `deploy.sh`. After deploying, update this section with the new resource IDs by running:
+**Partial teardown complete (2026-02-17).** ECS services scaled to 0; RDS snapshot taken. `terraform destroy` has NOT yet been run — Terraform state lives on the jumpbox (`i-0ca99b72d6c433824`, `35.153.20.29`). SSH in and run `./scripts/aws/teardown.sh --yes` to complete the destroy.
+
+**Latest RDS snapshot:** `sec-scraper-db-pre-teardown-20260217-1314` (available, 20 GB). `deploy.sh` will auto-detect this as the newest snapshot.
+
+**Known issue — jumpbox ↔ RDS connectivity:** The jumpbox lives in the default VPC (`vpc-0b112a894291e97f4`); RDS is in the sec-scraper private VPC (`vpc-0cc41987ba977e4dd`) with `publicly_accessible = false` and no VPC peering. The CIDR ingress rule in `security_groups.tf` is therefore unreachable from the jumpbox. See triage notes in the teardown session for resolution options.
+
+To redeploy after full teardown, create a new jumpbox (`create_jumpbox.sh`), SSH in, and run `deploy.sh`. After deploying, update this section with the new resource IDs by running:
 
 ```bash
 # From the jumpbox (after deploy.sh)
