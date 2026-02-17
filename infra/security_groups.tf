@@ -65,7 +65,7 @@ resource "aws_security_group" "ecs" {
 resource "aws_security_group" "rds" {
   name_prefix = "${var.project_name}-rds-"
   vpc_id      = aws_vpc.main.id
-  description = "RDS PostgreSQL - inbound from ECS and jumpbox"
+  description = "RDS PostgreSQL - inbound from ECS"
 
   ingress {
     description     = "PostgreSQL from ECS"
@@ -73,14 +73,6 @@ resource "aws_security_group" "rds" {
     to_port         = 5432
     protocol        = "tcp"
     security_groups = [aws_security_group.ecs.id]
-  }
-
-  ingress {
-    description     = "PostgreSQL from jumpbox"
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = [aws_security_group.jumpbox.id]
   }
 
   egress {

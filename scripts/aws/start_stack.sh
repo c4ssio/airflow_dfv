@@ -15,19 +15,7 @@ for arg in "$@"; do
   esac
 done
 
-# 1. Start jumpbox
-echo "==> Starting jumpbox EC2..."
-JUMPBOX_ID=$(aws ec2 describe-instances --region "$REGION" \
-  --filters "Name=tag:Name,Values=${PROJECT}-jumpbox" "Name=instance-state-name,Values=stopped" \
-  --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null)
-if [ -n "$JUMPBOX_ID" ] && [ "$JUMPBOX_ID" != "None" ]; then
-  aws ec2 start-instances --instance-ids "$JUMPBOX_ID" --region "$REGION" --no-cli-pager > /dev/null
-  echo "    Jumpbox ${JUMPBOX_ID} starting... (EIP will re-attach automatically)"
-else
-  echo "    No stopped jumpbox found. Check instance state."
-fi
-
-# 2. Start RDS
+# 1. Start RDS
 echo "==> Starting RDS instance..."
 RDS_ID=$(aws rds describe-db-instances --region "$REGION" \
   --query "DBInstances[?DBInstanceIdentifier=='${PROJECT}-db'].DBInstanceIdentifier" \
@@ -46,7 +34,7 @@ else
   echo "    No RDS instance found. Run terraform apply to recreate."
 fi
 
-# 3. Recreate ElastiCache if it was deleted
+# 2. Recreate ElastiCache if it was deleted
 if [ "$CREATE_REDIS" = true ]; then
   echo "==> Recreating ElastiCache cluster..."
   # Get subnet group and SG from existing resources
@@ -79,7 +67,7 @@ else
   fi
 fi
 
-# 4. Wait for RDS to be available before starting ECS
+# 3. Wait for RDS to be available before starting ECS
 echo "==> Waiting for RDS to become available..."
 RDS_STATUS="starting"
 TRIES=0
@@ -102,7 +90,7 @@ else
   echo "    Continuing anyway — services will retry."
 fi
 
-# 5. Scale ECS services back to 1
+# 4. Scale ECS services back to 1
 echo "==> Scaling ECS services to 1..."
 for svc in api-server scheduler dag-processor worker triggerer; do
   aws ecs update-service \
@@ -118,11 +106,3 @@ echo ""
 echo "==> Stack starting up."
 echo "    Services will take 2-3 minutes to stabilize."
 echo "    Check health: curl http://sec-scraper-alb-*.us-east-1.elb.amazonaws.com:8080/api/v2/monitor/health"
-
-# Show jumpbox IP
-if [ -n "$JUMPBOX_ID" ] && [ "$JUMPBOX_ID" != "None" ]; then
-  EIP=$(aws ec2 describe-addresses --region "$REGION" \
-    --filters "Name=tag:Name,Values=${PROJECT}-jumpbox-eip" \
-    --query 'Addresses[0].PublicIp' --output text 2>/dev/null || echo "unknown")
-  echo "    Jumpbox SSH: ssh -i ~/.ssh/remote_cursor_key ec2-user@${EIP}"
-fi

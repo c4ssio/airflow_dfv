@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Destroy all AWS resources. Usage: ./scripts/aws/teardown.sh [--yes]
+# Destroy all Terraform-managed AWS resources (everything except the jumpbox).
+# Run this FROM the jumpbox, then run destroy_jumpbox.sh locally to remove the jumpbox itself.
+#
+# Usage: ./scripts/aws/teardown.sh [--yes]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -8,8 +11,10 @@ INFRA_DIR="$(cd "$SCRIPT_DIR/../../infra" && pwd)"
 cd "$INFRA_DIR"
 
 if [ "${1:-}" != "--yes" ]; then
-  echo "This will DESTROY all sec-scraper AWS resources."
-  echo "Run with --yes to confirm, or press Enter to continue."
+  echo "This will DESTROY all sec-scraper AWS resources (VPC, ECS, RDS, etc.)."
+  echo "The jumpbox is NOT managed by Terraform — destroy it separately with destroy_jumpbox.sh."
+  echo ""
+  echo "Run with --yes to skip this prompt, or press Enter to continue."
   read -r
 fi
 
@@ -28,4 +33,8 @@ echo "    Services scaled down."
 echo "==> Terraform destroy..."
 terraform destroy -auto-approve
 
-echo "==> Done. All resources destroyed."
+echo ""
+echo "==> Terraform resources destroyed."
+echo ""
+echo "    The jumpbox is still running (it's not managed by Terraform)."
+echo "    To destroy it, run locally: ./scripts/aws/destroy_jumpbox.sh"
