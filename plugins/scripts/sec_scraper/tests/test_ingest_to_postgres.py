@@ -233,14 +233,14 @@ def test_ingest_ciks_processes_cik_directories(tmp_path, monkeypatch):
     postgres_config = {"schema": "sec_raw"}
     loader = _FakeLoadFns()
 
-    # Patch get_ciks_already_ingested and get_all_ingested_ciks to return empty sets
+    # Patch DB check functions to return empty sets (nothing ingested)
     monkeypatch.setattr(
         "scripts.sec_scraper.tasks.ingest_to_postgres.get_ciks_already_ingested",
         lambda conn, schema, date: set(),
     )
     monkeypatch.setattr(
-        "scripts.sec_scraper.tasks.ingest_to_postgres.get_all_ingested_ciks",
-        lambda conn, schema: set(),
+        "scripts.sec_scraper.tasks.ingest_to_postgres.get_previously_ingested_from_set",
+        lambda conn, schema, cik_set: set(),
     )
 
     result = ingest_ciks(cfg, postgres_config, loader, upsert_metric_metadata_fn=MagicMock())
@@ -269,8 +269,8 @@ def test_ingest_ciks_skips_already_ingested(tmp_path, monkeypatch):
         lambda conn, schema, date: {"0000000100"},
     )
     monkeypatch.setattr(
-        "scripts.sec_scraper.tasks.ingest_to_postgres.get_all_ingested_ciks",
-        lambda conn, schema: set(),
+        "scripts.sec_scraper.tasks.ingest_to_postgres.get_previously_ingested_from_set",
+        lambda conn, schema, cik_set: set(),
     )
 
     result = ingest_ciks(cfg, postgres_config, loader, upsert_metric_metadata_fn=MagicMock())
@@ -308,8 +308,8 @@ def test_ingest_ciks_force_ingest_overrides_skip_logic(tmp_path, monkeypatch):
         lambda conn, schema, date: set(),  # Not ingested TODAY
     )
     monkeypatch.setattr(
-        "scripts.sec_scraper.tasks.ingest_to_postgres.get_all_ingested_ciks",
-        lambda conn, schema: {"0000000100"},  # Previously ingested
+        "scripts.sec_scraper.tasks.ingest_to_postgres.get_previously_ingested_from_set",
+        lambda conn, schema, cik_set: {"0000000100"},  # Previously ingested
     )
 
     # Without force_ingest_ciks, CIK should be skipped
@@ -321,6 +321,39 @@ def test_ingest_ciks_force_ingest_overrides_skip_logic(tmp_path, monkeypatch):
     loader.calls = []
 
     # With force_ingest_ciks, CIK should be processed
+    result = ingest_ciks(
+        cfg,
+        postgres_config,
+        loader,
+        upsert_metric_metadata_fn=MagicMock(),
+        force_ingest_ciks={"0000000100"},
+    )
+    assert result["processed"] == 1
+    assert result["skipped"] == 0
+    assert len(loader.calls) > 0
+
+
+def test_ingest_ciks_force_ingest_overrides_same_day(tmp_path, monkeypatch):
+    """Force-ingest CIKs are retried even if partially ingested today."""
+    cik_dir = tmp_path / "cik=100"
+    cik_dir.mkdir()
+    (cik_dir / "submissions.json").write_text(json.dumps({"name": "Corp"}))
+
+    cfg = _make_settings(local_dir=str(tmp_path))
+    postgres_config = {"schema": "sec_raw"}
+    loader = _FakeLoadFns()
+
+    # CIK 100 was already ingested today (partial — e.g. submissions OK, facts failed)
+    monkeypatch.setattr(
+        "scripts.sec_scraper.tasks.ingest_to_postgres.get_ciks_already_ingested",
+        lambda conn, schema, date: {"0000000100"},
+    )
+    monkeypatch.setattr(
+        "scripts.sec_scraper.tasks.ingest_to_postgres.get_previously_ingested_from_set",
+        lambda conn, schema, cik_set: {"0000000100"},
+    )
+
+    # With force_ingest_ciks, CIK should be re-processed despite same-day ingestion
     result = ingest_ciks(
         cfg,
         postgres_config,

@@ -7,19 +7,41 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INFRA_DIR="$REPO_ROOT/infra"
 
+REGION="us-east-1"
+PROJECT="sec-scraper"
 SKIP_BUILD=false
 SKIP_INIT=false
+SNAPSHOT=""
 for arg in "$@"; do
   case $arg in
-    --skip-build) SKIP_BUILD=true ;;
-    --skip-init)  SKIP_INIT=true ;;
+    --skip-build)  SKIP_BUILD=true ;;
+    --skip-init)   SKIP_INIT=true ;;
+    --snapshot=*)  SNAPSHOT="${arg#*=}" ;;
   esac
 done
+
+# Auto-detect latest RDS snapshot if not specified
+if [ -z "$SNAPSHOT" ]; then
+  echo "==> Checking for latest RDS snapshot..."
+  SNAPSHOT=$(aws rds describe-db-snapshots --region "$REGION" \
+    --query "reverse(sort_by(DBSnapshots[?starts_with(DBSnapshotIdentifier, '${PROJECT}-db-pre-teardown-')], &SnapshotCreateTime))[0].DBSnapshotIdentifier" \
+    --output text 2>/dev/null || echo "None")
+  if [ "$SNAPSHOT" = "None" ] || [ -z "$SNAPSHOT" ]; then
+    echo "    No pre-teardown snapshot found. Starting fresh."
+    SNAPSHOT=""
+  else
+    echo "    Found latest snapshot: ${SNAPSHOT}"
+  fi
+fi
 
 echo "==> Terraform init + apply..."
 cd "$INFRA_DIR"
 terraform init -input=false
-terraform apply -auto-approve
+if [ -n "$SNAPSHOT" ]; then
+  terraform apply -auto-approve -var "rds_snapshot_identifier=${SNAPSHOT}"
+else
+  terraform apply -auto-approve
+fi
 
 # Get outputs
 ECR_URL=$(terraform output -raw ecr_repository_url)

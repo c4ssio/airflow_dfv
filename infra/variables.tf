@@ -46,6 +46,12 @@ variable "db_username" {
   default     = "airflow"
 }
 
+variable "rds_snapshot_identifier" {
+  description = "RDS snapshot to restore from. Empty string = fresh DB. Set by start_stack.sh to latest pre-teardown snapshot."
+  type        = string
+  default     = ""
+}
+
 variable "sec_user_agent" {
   description = "SEC API user agent string"
   type        = string

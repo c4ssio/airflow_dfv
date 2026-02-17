@@ -332,11 +332,16 @@ cd .. && ./scripts/aws/deploy.sh
 
 ### Tearing Down
 
+Teardown creates a timestamped RDS snapshot (e.g., `sec-scraper-db-pre-teardown-20260217-1430`) before destroying. The next `deploy.sh` auto-detects the latest snapshot.
+
 ```bash
-# 1. On the jumpbox: destroy Terraform resources
+# 1. On the jumpbox: destroy Terraform resources (snapshots RDS first)
 ./scripts/aws/teardown.sh --yes
 
-# 2. Locally: destroy the jumpbox itself
+# 2. Skip the snapshot if you don't need the data
+./scripts/aws/teardown.sh --yes --skip-snapshot
+
+# 3. Locally: destroy the jumpbox itself
 ./scripts/aws/destroy_jumpbox.sh
 ```
 
@@ -344,10 +349,15 @@ cd .. && ./scripts/aws/deploy.sh
 
 State is stored locally in `infra/terraform.tfstate` (gitignored). For team use, configure an S3 backend in `main.tf`.
 
+### RDS Snapshots
+
+`teardown.sh` creates a timestamped snapshot before destroying (e.g., `sec-scraper-db-pre-teardown-20260217-1430`). `deploy.sh` auto-detects the latest `sec-scraper-db-pre-teardown-*` snapshot and restores from it. Override with `--snapshot=<id>` or set `rds_snapshot_identifier` in `terraform.tfvars`.
+
 ### Security Notes
 
 - **No hardcoded secrets**: DB password is generated via `random_password` at apply time.
 - **ALB access**: Restricted by `allowed_cidr` variable (default: `0.0.0.0/0` — set to your IP).
+- **Jumpbox RDS access**: The RDS security group allows PostgreSQL (5432) from `allowed_cidr`, so the jumpbox can connect directly for debugging.
 - **Private subnets**: RDS, Redis, EFS, and ECS tasks are in private subnets; only the ALB is public.
 - **IAM least-privilege**: Execution role has ECR pull + Secrets Manager read; task role has EFS mount + SSM messages (for `execute-command`).
 - **Never commit**: `infra/terraform.tfstate`, `infra/.terraform/`, or `infra/terraform.tfvars` (all gitignored).
@@ -528,6 +538,31 @@ echo "ALB DNS: $(terraform output -raw alb_url)"
 - API uses JWT tokens via `/auth/token`, not basic auth.
 - DAGs are paused at creation on ECS (`AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=true`). Always `unpause` before triggering.
 - **CloudWatch remote logging is broken**: Airflow 3.x has a known issue with the `apache-airflow-providers-amazon` CloudWatch task handler ([GH#52501](https://github.com/apache/airflow/issues/52501)). Do NOT set `AIRFLOW__LOGGING__REMOTE_LOGGING=True` with CloudWatch — it crashes all services.
+
+### Checking Airflow Task Logs (ECS)
+
+CloudWatch remote logging does NOT work with Airflow 3.x (see gotcha above). Instead, use these methods to read task logs:
+
+**Method 1: Airflow REST API (preferred — works from Claude Code sessions)**
+```bash
+# Get task logs via the API (requires JWT token — see API Authentication above)
+curl -s "http://<alb-url>:8080/api/v2/dags/sec_scraper/dagRuns/<run_id>/taskInstances/<task_id>/logs/1" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**Method 2: ECS Exec into the worker (requires jumpbox + SSM)**
+```bash
+# From the jumpbox — exec into the running worker container
+aws ecs execute-command --cluster sec-scraper-cluster \
+  --task <task-id> --container worker \
+  --interactive --command "cat /opt/airflow/logs/dag_id=sec_scraper/run_id=<run_id>/task_id=<task_id>/attempt=1.log"
+```
+
+**Method 3: EFS (logs persist on the shared volume)**
+
+Airflow writes task logs to `/opt/airflow/logs/` which is mounted on EFS. If you can access EFS (e.g., from another ECS task or an EC2 in the same VPC), browse the log files directly.
+
+**Do NOT use CloudWatch** for Airflow task logs — only ECS container stdout/stderr goes to CloudWatch (`/ecs/sec-scraper`), which contains Airflow service logs (scheduler, API server) but not individual task execution logs.
 
 ### Airflow 3.x ECS-Critical Configuration
 

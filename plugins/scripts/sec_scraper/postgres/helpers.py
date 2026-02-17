@@ -111,6 +111,28 @@ def get_all_ingested_ciks(conn: Any, schema: str) -> Set[str]:
         cursor.close()
 
 
+def get_previously_ingested_from_set(
+    conn: Any, schema: str, candidate_ciks: Set[str]
+) -> Set[str]:
+    """Return which of the candidate CIKs already have rows in submissions (any date).
+
+    More efficient than get_all_ingested_ciks when the candidate set is small
+    relative to the total number of CIKs in the table.
+    """
+    if not candidate_ciks:
+        return set()
+    cursor = conn.cursor()
+    try:
+        placeholders = ",".join(["%s"] * len(candidate_ciks))
+        cursor.execute(
+            f"SELECT DISTINCT cik FROM {schema}.submissions WHERE cik IN ({placeholders})",
+            list(candidate_ciks),
+        )
+        return {row[0] for row in cursor.fetchall() if row and row[0]}
+    finally:
+        cursor.close()
+
+
 def load_ndjson_batch_to_postgres(
     conn: Any,
     table_name: str,
