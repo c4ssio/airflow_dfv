@@ -8,3 +8,6 @@ sec_user_agent = "drclive SEC scraper (you@drclive.net)"
 # redis_node_type    = "cache.t4g.small"
 # worker_cpu         = 2048
 # worker_memory      = 4096
+
+# Restore from RDS snapshot (set by start_stack.sh automatically, or set manually)
+# rds_snapshot_identifier = "sec-scraper-db-pre-teardown-20260217-1430"

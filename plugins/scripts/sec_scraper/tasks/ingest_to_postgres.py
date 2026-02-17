@@ -11,10 +11,10 @@ from scripts.sec_scraper.common import (
     convert_submissions_to_ndjson,
 )
 from scripts.sec_scraper.postgres.helpers import (
-    get_all_ingested_ciks,
     get_ciks_already_ingested,
     get_postgres_config,
     get_postgres_connection,
+    get_previously_ingested_from_set,
     load_ndjson_batch_to_postgres,
     upsert_metric_metadata,
 )
@@ -162,16 +162,24 @@ def ingest_ciks(
     try:
         conn = load_fn.get_connection(postgres_config, schema)
 
-        # Skip CIKs already imported for this ingest_date (idempotent runs)
-        # Also skip CIKs that have any existing data from prior ingestions,
-        # UNLESS they're in force_ingest_ciks (new filings detected)
-        already_ingested = get_ciks_already_ingested(conn, schema, ingest_date)
-        previously_ingested = get_all_ingested_ciks(conn, schema)
-        skip_set = already_ingested | previously_ingested
+        # Build candidate set from CIK dirs on disk (targeted query)
+        candidate_ciks = {_cik_from_dir_name(d) for d in cik_dirs}
 
-        # Remove force-ingest CIKs from skip set (but keep today's ingests skipped)
+        # Check DB for CIKs already ingested today (idempotent same-day reruns)
+        already_ingested_today = get_ciks_already_ingested(conn, schema, ingest_date)
+
+        # Check DB for CIKs previously ingested (any date) — only for
+        # the candidates on disk, not the entire submissions table
+        previously_ingested = get_previously_ingested_from_set(
+            conn, schema, candidate_ciks
+        )
+
+        # Skip logic:
+        # - CIKs ingested today: skip unless in force_ingest_ciks (allows retry
+        #   of partially-ingested CIKs, e.g. submissions OK but companyfacts failed)
+        # - CIKs ingested previously: skip unless in force_ingest_ciks
         force_set = force_ingest_ciks or set()
-        skip_set = (skip_set - force_set) | already_ingested
+        skip_set = (already_ingested_today | previously_ingested) - force_set
 
         cik_dirs_to_process = [
             d for d in cik_dirs
