@@ -154,11 +154,22 @@ with DAG(  # type: ignore[call-arg]
 
     @task
     def ingest_to_postgres(summary: Dict[str, Any]) -> Dict[str, Any]:
-        """Convert JSON files to NDJSON and load into PostgreSQL tables."""
+        """Convert JSON files to NDJSON and load into PostgreSQL tables.
+
+        Accepts the summary from fetch_and_store_companies, which includes:
+        - ciks_needing_ingest: List of CIKs with new filings or first-time loads
+        """
         cfg = _settings()
         from scripts.sec_scraper.tasks.ingest_to_postgres import ingest_to_postgres as _ingest
         try:
-            result = _ingest(cfg)
+            # Extract CIKs that need ingestion (new filings or first-time)
+            force_ingest_ciks = summary.get("ciks_needing_ingest", [])
+            logger.info(
+                "Force-ingesting %d CIKs with new filings or first-time loads",
+                len(force_ingest_ciks),
+            )
+
+            result = _ingest(cfg, force_ingest_ciks=force_ingest_ciks)
             logger.info(
                 "Ingestion complete: %d CIKs processed, %d errors, %d skipped (already ingested)",
                 result.get("processed", 0),

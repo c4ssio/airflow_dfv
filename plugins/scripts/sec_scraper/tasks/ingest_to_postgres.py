@@ -137,8 +137,14 @@ def ingest_ciks(
     postgres_config: Dict[str, Any],
     load_fn,
     upsert_metric_metadata_fn,
+    force_ingest_ciks: set[str] | None = None,
 ) -> Dict[str, Any]:
-    """Core ingestion workflow, parameterized by DB functions for easier testing."""
+    """Core ingestion workflow, parameterized by DB functions for easier testing.
+
+    Args:
+        force_ingest_ciks: Set of CIK strings (zero-padded) to ingest even if
+                           they already exist in the DB. Used for CIKs with new filings.
+    """
     base_dir = cfg.local_dir
     cik_dirs = _discover_cik_dirs(cfg)
 
@@ -157,10 +163,16 @@ def ingest_ciks(
         conn = load_fn.get_connection(postgres_config, schema)
 
         # Skip CIKs already imported for this ingest_date (idempotent runs)
-        # Also skip CIKs that have any existing data from prior ingestions
+        # Also skip CIKs that have any existing data from prior ingestions,
+        # UNLESS they're in force_ingest_ciks (new filings detected)
         already_ingested = get_ciks_already_ingested(conn, schema, ingest_date)
         previously_ingested = get_all_ingested_ciks(conn, schema)
         skip_set = already_ingested | previously_ingested
+
+        # Remove force-ingest CIKs from skip set (but keep today's ingests skipped)
+        force_set = force_ingest_ciks or set()
+        skip_set = (skip_set - force_set) | already_ingested
+
         cik_dirs_to_process = [
             d for d in cik_dirs
             if _cik_from_dir_name(d) not in skip_set
@@ -244,12 +256,19 @@ def ingest_ciks(
     }
 
 
-def ingest_to_postgres(cfg: Settings) -> Dict[str, Any]:
+def ingest_to_postgres(
+    cfg: Settings,
+    force_ingest_ciks: List[str] | None = None,
+) -> Dict[str, Any]:
     """
     Ingest all CIKs to PostgreSQL.
-    
+
     Loads PostgreSQL config, creates connection helpers, and delegates to ingest_ciks.
     This is the main entry point for the DAG task.
+
+    Args:
+        force_ingest_ciks: List of CIK strings (zero-padded) to ingest even if
+                           they already exist in the DB. Used for CIKs with new filings.
     """
     # Load PostgreSQL config
     try:
@@ -281,5 +300,6 @@ def ingest_to_postgres(cfg: Settings) -> Dict[str, Any]:
         postgres_config=postgres_config,
         load_fn=_LoadFns,
         upsert_metric_metadata_fn=upsert_metric_metadata,
+        force_ingest_ciks=set(force_ingest_ciks) if force_ingest_ciks else None,
     )
 

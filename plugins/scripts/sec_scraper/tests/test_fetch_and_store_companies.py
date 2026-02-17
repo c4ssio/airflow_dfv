@@ -231,3 +231,34 @@ def test_fetch_and_store_companies_handles_empty_list(tmp_path):
 
     assert result["total_companies"] == 0
     assert result["facts_downloaded"] == 0
+
+
+def test_fetch_and_store_companies_tracks_ciks_needing_ingest(tmp_path, monkeypatch):
+    """Test that CIKs with new filings or first-time loads are tracked for ingestion."""
+    local_dir = str(tmp_path)
+    cfg = _make_settings(local_dir=local_dir)
+
+    submissions_payload = {
+        "name": "Corp",
+        "filings": {"recent": {"filingDate": ["2025-06-01"]}},
+    }
+    facts_payload = {"entityName": "Corp", "facts": {}}
+
+    session = _DummySession({
+        "submissions/CIK": submissions_payload,
+        "companyfacts/CIK": facts_payload,
+    })
+
+    companies = [
+        {"cik": "1000", "ticker": "AAA"},  # First-time CIK
+        {"cik": "2000", "ticker": "BBB"},  # First-time CIK
+    ]
+
+    result = fetch_and_store_companies(cfg, session, companies, "https://data.sec.gov")
+
+    assert result["total_companies"] == 2
+    assert "ciks_needing_ingest" in result
+    # Both are first-time loads, so both should be in the list
+    assert len(result["ciks_needing_ingest"]) == 2
+    assert "0000001000" in result["ciks_needing_ingest"]
+    assert "0000002000" in result["ciks_needing_ingest"]

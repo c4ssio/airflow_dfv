@@ -160,6 +160,7 @@ def fetch_and_store_companies(
     results = []
     facts_downloaded_count = 0
     facts_skipped_count = 0
+    ciks_needing_ingest = []  # Track CIKs with new data or first-time loads
 
     # Write results incrementally to a file to avoid losing them when we clear the list
     results_file_path = None
@@ -173,6 +174,11 @@ def fetch_and_store_companies(
         mem_before = get_memory_mb()
 
         try:
+            # Check if this CIK has existing data before processing
+            cik = company["cik"]
+            existing_data = find_existing_data(cfg, cik)
+            is_first_time = not existing_data or not existing_data.get("metadata")
+
             result = process_single_company(
                 cfg,
                 session,
@@ -189,6 +195,10 @@ def fetch_and_store_companies(
             if results_file_path:
                 with open(results_file_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(result, separators=(",", ":"), ensure_ascii=False) + "\n")
+
+            # Track CIKs that need ingestion: new filings OR first-time load
+            if result.get("facts_downloaded", False) or is_first_time:
+                ciks_needing_ingest.append(pad_cik(cik))
 
             if result.get("facts_downloaded", False):
                 facts_downloaded_count += 1
@@ -261,6 +271,10 @@ def fetch_and_store_companies(
         facts_downloaded_count,
         facts_skipped_count,
     )
+    logger.info(
+        "CIKs needing ingestion (new filings or first-time): %d",
+        len(ciks_needing_ingest),
+    )
     logger.info("=" * 80)
 
     return {
@@ -268,4 +282,5 @@ def fetch_and_store_companies(
         "total_companies": total_companies,
         "facts_downloaded": facts_downloaded_count,
         "facts_skipped": facts_skipped_count,
+        "ciks_needing_ingest": ciks_needing_ingest,
     }
