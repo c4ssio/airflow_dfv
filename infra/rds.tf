@@ -35,6 +35,8 @@ resource "aws_db_instance" "main" {
   allocated_storage = var.rds_allocated_storage
   storage_type      = "gp3"
 
+  snapshot_identifier = "sec-scraper-db-pre-teardown-20260216"
+
   db_name  = "airflow"
   username = var.db_username
   password = random_password.db.result

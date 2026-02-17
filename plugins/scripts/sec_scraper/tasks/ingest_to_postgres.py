@@ -11,6 +11,7 @@ from scripts.sec_scraper.common import (
     convert_submissions_to_ndjson,
 )
 from scripts.sec_scraper.postgres.helpers import (
+    get_all_ingested_ciks,
     get_ciks_already_ingested,
     get_postgres_config,
     get_postgres_connection,
@@ -156,10 +157,13 @@ def ingest_ciks(
         conn = load_fn.get_connection(postgres_config, schema)
 
         # Skip CIKs already imported for this ingest_date (idempotent runs)
+        # Also skip CIKs that have any existing data from prior ingestions
         already_ingested = get_ciks_already_ingested(conn, schema, ingest_date)
+        previously_ingested = get_all_ingested_ciks(conn, schema)
+        skip_set = already_ingested | previously_ingested
         cik_dirs_to_process = [
             d for d in cik_dirs
-            if _cik_from_dir_name(d) not in already_ingested
+            if _cik_from_dir_name(d) not in skip_set
         ]
         skipped = len(cik_dirs) - len(cik_dirs_to_process)
 

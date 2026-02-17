@@ -35,12 +35,13 @@ output "airflow_admin_password" {
   sensitive   = true
 }
 
-output "jumpbox_public_ip" {
-  description = "Jumpbox Elastic IP (persists across stop/start)"
-  value       = aws_eip.jumpbox.public_ip
-}
-
-output "jumpbox_instance_id" {
-  description = "Jumpbox EC2 instance ID (for SSM Session Manager)"
-  value       = aws_instance.jumpbox.id
-}
+## Jumpbox outputs temporarily removed for rebuild
+## output "jumpbox_public_ip" {
+##   description = "Jumpbox Elastic IP (persists across stop/start)"
+##   value       = aws_eip.jumpbox.public_ip
+## }
+##
+## output "jumpbox_instance_id" {
+##   description = "Jumpbox EC2 instance ID (for SSM Session Manager)"
+##   value       = aws_instance.jumpbox.id
+## }

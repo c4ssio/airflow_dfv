@@ -101,6 +101,16 @@ def get_ciks_already_ingested(conn: Any, schema: str, ingest_date: str) -> Set[s
         cursor.close()
 
 
+def get_all_ingested_ciks(conn: Any, schema: str) -> Set[str]:
+    """Return set of zero-padded CIKs that have ANY row in submissions (any ingest_date)."""
+    cursor = conn.cursor()
+    try:
+        cursor.execute(f"SELECT DISTINCT cik FROM {schema}.submissions")
+        return {row[0] for row in cursor.fetchall() if row and row[0]}
+    finally:
+        cursor.close()
+
+
 def load_ndjson_batch_to_postgres(
     conn: Any,
     table_name: str,
