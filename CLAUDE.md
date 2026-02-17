@@ -396,14 +396,55 @@ aws ssm start-session --target $(cd infra && terraform output -raw jumpbox_insta
 
 ## Operational Notes for Claude Code Sessions
 
-### AWS Credentials
+### FIRST: Install AWS CLI v2 and Set Credentials
 
-When connecting to the AWS account from a Claude Code session (without jumpbox access):
+**Before doing anything AWS-related**, install the latest AWS CLI v2 and configure credentials:
 
-- **AWS CLI is not pre-installed** — install with `pip install awscli`.
-- Set credentials via env vars: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION=us-east-1`.
-- **Cannot run `terraform apply`** — use the jumpbox for terraform operations.
-- **Cannot use `aws ecs execute-command`** — requires SSM Session Manager plugin (not available in Claude Code sandbox).
+```bash
+# Install AWS CLI v2 (required — v1 is missing features like --no-cli-pager)
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp && /tmp/aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli
+rm -rf /tmp/awscliv2.zip /tmp/aws
+
+# Set credentials (user will provide these)
+export AWS_ACCESS_KEY_ID=<key>
+export AWS_SECRET_ACCESS_KEY=<secret>
+export AWS_DEFAULT_REGION=us-east-1
+```
+
+### SECOND: Use the Jumpbox for Deploys
+
+The jumpbox EC2 instance is the canonical place to run Terraform and deploy operations. It comes pre-installed with Terraform, AWS CLI, Docker, and SSM Session Manager. **All `terraform apply`, `terraform destroy`, and deploy scripts should be run from the jumpbox**, not from Claude Code sessions.
+
+```bash
+# SSH to jumpbox
+ssh -i ~/.ssh/remote_cursor_key ec2-user@$(cd infra && terraform output -raw jumpbox_public_ip)
+
+# Or use SSM (no SSH key needed)
+aws ssm start-session --target $(cd infra && terraform output -raw jumpbox_instance_id)
+```
+
+**What Claude Code sessions CAN do directly:**
+- Query AWS resources (`aws ecs list-clusters`, `aws rds describe-db-instances`, etc.)
+- Trigger DAG runs via the Airflow REST API
+- Update ECS task definitions and redeploy services
+- Delete individual resources for teardown
+- Run `aws ecs run-task` with command overrides
+
+**What requires the jumpbox:**
+- `terraform apply` / `terraform destroy` (Terraform is not available in Claude Code sandbox)
+- `aws ecs execute-command` (requires SSM Session Manager plugin)
+- Building and pushing Docker images to ECR (requires Docker daemon)
+
+### IAM Permissions for the `sec_scraper` User
+
+The `sec_scraper` IAM user needs these permissions for full teardown/management capability. If any are missing, ask the root account owner to grant them:
+
+- `iam:ListRoles`, `iam:GetRole`, `iam:DeleteRole`, `iam:DeleteRolePolicy`, `iam:DetachRolePolicy`, `iam:ListRolePolicies`, `iam:ListAttachedRolePolicies` — needed to clean up IAM roles during teardown
+- `iam:ListPolicies`, `iam:DeletePolicy`, `iam:ListPolicyVersions`, `iam:DeletePolicyVersion` — needed to clean up IAM policies during teardown
+- `iam:ListInstanceProfiles`, `iam:RemoveRoleFromInstanceProfile`, `iam:DeleteInstanceProfile` — needed to clean up instance profiles
+
+Without these, IAM roles/policies created by Terraform (e.g., `sec-scraper-execution-role`, `sec-scraper-task-role`) must be manually deleted from the AWS Console or root account.
 
 ### Running Airflow CLI Commands Remotely
 
@@ -477,18 +518,17 @@ When you need to update a running service's config without terraform (e.g., addi
 
 ### Key Resource IDs (Current Deployment)
 
-| Resource | Value |
-|----------|-------|
-| VPC | `vpc-068394bf0f50bb05b` |
-| Private subnets | `subnet-0b9d77ddeb71d38fc`, `subnet-0bc236aee1170c5f5` |
-| Public subnets | `subnet-048aef579a62e1f3b`, `subnet-0870391697fc216c4` |
-| ECS security group | `sg-04d71ebe55272f655` |
-| ALB security group | `sg-041181b4ade7d74f7` |
-| Jumpbox security group | `sg-02704825b173677e0` |
-| Jumpbox instance | `i-08608d20f790c623f` |
-| Jumpbox Elastic IP | `44.198.7.177` (`eipalloc-0f95920bc202f2538`) |
-| ALB DNS | `sec-scraper-alb-2104629405.us-east-1.elb.amazonaws.com` |
-| CloudWatch log group | `/ecs/sec-scraper` |
+**No active deployment.** All AWS resources were torn down on 2026-02-17. To redeploy, use the jumpbox to run `terraform apply` followed by `./scripts/aws/deploy.sh`. After deploying, update this section with the new resource IDs by running:
+
+```bash
+# From the jumpbox (after terraform apply)
+cd infra
+echo "VPC: $(terraform output -raw vpc_id)"
+echo "Private subnets: $(terraform output -json private_subnet_ids)"
+echo "Public subnets: $(terraform output -json public_subnet_ids)"
+echo "ALB DNS: $(terraform output -raw alb_url)"
+echo "Jumpbox IP: $(terraform output -raw jumpbox_public_ip)"
+```
 
 ### Airflow 3.x Gotchas
 
