@@ -87,7 +87,7 @@ resource "aws_ecs_task_definition" "init" {
 
     entryPoint = ["/bin/bash", "-c"]
     command = [
-      "pip install psycopg2-binary && python -c \"import psycopg2; conn = psycopg2.connect(host='${local.rds_host}', port=5432, user='${local.rds_user}', password='${local.rds_password}', dbname='airflow'); conn.autocommit = True; cur = conn.cursor(); cur.execute(\\\"SELECT 1 FROM pg_database WHERE datname='sec_data'\\\"); exists = cur.fetchone(); cur.execute(\\\"CREATE DATABASE sec_data\\\") if not exists else None; conn.close(); print('sec_data DB ready')\" && airflow db migrate"
+      "pip install --no-cache-dir -r /requirements.txt && python -c \"import psycopg2; conn = psycopg2.connect(host='${local.rds_host}', port=5432, user='${local.rds_user}', password='${local.rds_password}', dbname='airflow'); conn.autocommit = True; cur = conn.cursor(); cur.execute(\\\"SELECT 1 FROM pg_database WHERE datname='sec_data'\\\"); exists = cur.fetchone(); cur.execute(\\\"CREATE DATABASE sec_data\\\") if not exists else None; conn.close(); print('sec_data DB ready')\" && airflow db migrate && python /opt/airflow/plugins/scripts/sec_scraper/postgres/deploy_migrations.py"
     ]
 
     environment = local.airflow_env
@@ -135,7 +135,7 @@ resource "aws_ecs_task_definition" "api_server" {
     image     = local.image
     essential = true
     entryPoint = ["/bin/bash", "-c"]
-    command   = ["echo \"{\\\"admin\\\": \\\"$AIRFLOW_ADMIN_PASSWORD\\\"}\" > /opt/airflow/simple_auth_manager_passwords.json.generated && exec airflow api-server"]
+    command   = ["pip install --no-cache-dir -r /requirements.txt && echo \"{\\\"admin\\\": \\\"$AIRFLOW_ADMIN_PASSWORD\\\"}\" > /opt/airflow/simple_auth_manager_passwords.json.generated && exec airflow api-server"]
 
     portMappings = [{
       containerPort = 8080
@@ -222,7 +222,7 @@ resource "aws_ecs_task_definition" "scheduler" {
     image     = local.image
     essential = true
     entryPoint = ["/bin/bash", "-c"]
-    command    = ["python -c 'import redis.client' && exec airflow scheduler"]
+    command    = ["pip install --no-cache-dir -r /requirements.txt && python -c 'import redis.client' && exec airflow scheduler"]
 
     environment = local.airflow_env
 
@@ -287,7 +287,8 @@ resource "aws_ecs_task_definition" "dag_processor" {
     name      = "dag-processor"
     image     = local.image
     essential = true
-    command   = ["dag-processor"]
+    entryPoint = ["/bin/bash", "-c"]
+    command   = ["pip install --no-cache-dir -r /requirements.txt && exec airflow dag-processor"]
 
     environment = local.airflow_env
 
@@ -352,7 +353,8 @@ resource "aws_ecs_task_definition" "worker" {
     name      = "worker"
     image     = local.image
     essential = true
-    command   = ["celery", "worker"]
+    entryPoint = ["/bin/bash", "-c"]
+    command   = ["pip install --no-cache-dir -r /requirements.txt && exec airflow celery worker"]
 
     environment = local.airflow_env
 
@@ -419,7 +421,8 @@ resource "aws_ecs_task_definition" "triggerer" {
     name      = "triggerer"
     image     = local.image
     essential = true
-    command   = ["triggerer"]
+    entryPoint = ["/bin/bash", "-c"]
+    command   = ["pip install --no-cache-dir -r /requirements.txt && exec airflow triggerer"]
 
     environment = local.airflow_env
 

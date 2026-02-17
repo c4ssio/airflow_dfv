@@ -233,10 +233,14 @@ def test_ingest_ciks_processes_cik_directories(tmp_path, monkeypatch):
     postgres_config = {"schema": "sec_raw"}
     loader = _FakeLoadFns()
 
-    # Patch get_ciks_already_ingested to return empty set
+    # Patch get_ciks_already_ingested and get_all_ingested_ciks to return empty sets
     monkeypatch.setattr(
         "scripts.sec_scraper.tasks.ingest_to_postgres.get_ciks_already_ingested",
         lambda conn, schema, date: set(),
+    )
+    monkeypatch.setattr(
+        "scripts.sec_scraper.tasks.ingest_to_postgres.get_all_ingested_ciks",
+        lambda conn, schema: set(),
     )
 
     result = ingest_ciks(cfg, postgres_config, loader, upsert_metric_metadata_fn=MagicMock())
@@ -263,6 +267,10 @@ def test_ingest_ciks_skips_already_ingested(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "scripts.sec_scraper.tasks.ingest_to_postgres.get_ciks_already_ingested",
         lambda conn, schema, date: {"0000000100"},
+    )
+    monkeypatch.setattr(
+        "scripts.sec_scraper.tasks.ingest_to_postgres.get_all_ingested_ciks",
+        lambda conn, schema: set(),
     )
 
     result = ingest_ciks(cfg, postgres_config, loader, upsert_metric_metadata_fn=MagicMock())
