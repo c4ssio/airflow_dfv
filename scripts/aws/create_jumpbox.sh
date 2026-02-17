@@ -60,21 +60,33 @@ if [ -z "$MY_IP" ]; then
 fi
 echo "SSH access from: $MY_IP"
 
-# --- Find default VPC ---
-echo "Finding default VPC..."
-VPC_ID=$(aws ec2 describe-vpcs --filters "Name=is-default,Values=true" \
-  --query 'Vpcs[0].VpcId' --output text --region "$REGION")
-if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
-  echo "ERROR: No default VPC found in $REGION. Create one with: aws ec2 create-default-vpc" >&2
-  exit 1
-fi
-echo "Using default VPC: $VPC_ID"
+# --- Find VPC: prefer sec-scraper-vpc (same VPC as RDS) for direct DB access,
+#     fall back to default VPC when sec-scraper-vpc doesn't exist yet (first deploy). ---
+echo "Looking for ${PROJECT}-vpc..."
+VPC_ID=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=${PROJECT}-vpc" \
+  --query 'Vpcs[0].VpcId' --output text --region "$REGION" 2>/dev/null || echo "None")
 
-# Pick the first public subnet in the default VPC
-SUBNET_ID=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" \
-  --query 'Subnets[?MapPublicIpOnLaunch==`true`] | [0].SubnetId' --output text --region "$REGION")
+if [ -n "$VPC_ID" ] && [ "$VPC_ID" != "None" ]; then
+  echo "Using ${PROJECT}-vpc: $VPC_ID (jumpbox will share VPC with RDS)"
+  SUBNET_ID=$(aws ec2 describe-subnets \
+    --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=*public*" \
+    --query 'Subnets[0].SubnetId' --output text --region "$REGION")
+else
+  echo "WARNING: ${PROJECT}-vpc not found — falling back to default VPC."
+  echo "         The jumpbox will not be able to reach RDS directly."
+  echo "         Re-run create_jumpbox.sh after terraform apply to get same-VPC placement."
+  VPC_ID=$(aws ec2 describe-vpcs --filters "Name=is-default,Values=true" \
+    --query 'Vpcs[0].VpcId' --output text --region "$REGION")
+  if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+    echo "ERROR: No default VPC found in $REGION. Create one with: aws ec2 create-default-vpc" >&2
+    exit 1
+  fi
+  echo "Using default VPC: $VPC_ID"
+  SUBNET_ID=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" \
+    --query 'Subnets[?MapPublicIpOnLaunch==`true`] | [0].SubnetId' --output text --region "$REGION")
+fi
+
 if [ -z "$SUBNET_ID" ] || [ "$SUBNET_ID" = "None" ]; then
-  # Fallback: just use the first subnet
   SUBNET_ID=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" \
     --query 'Subnets[0].SubnetId' --output text --region "$REGION")
 fi
